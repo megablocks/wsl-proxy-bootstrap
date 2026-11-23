@@ -12,7 +12,7 @@ Run as your normal WSL user — **never with `sudo`**:
 curl -fsSL https://raw.githubusercontent.com/megablocks/wsl-proxy-bootstrap/main/install.sh | bash
 ```
 
-The installer itself uses `sudo` only for APT/keyring/repository operations. On first run it creates a new, dedicated Ed25519 key inside the WSL filesystem, prints **only the public key**, and exits with status 20. It does not start a tunnel or claim that the proxy works.
+The installer itself uses `sudo` only for APT/keyring/repository operations. On first run it creates a new, dedicated Ed25519 key inside the WSL filesystem, prints **only the public key**, and exits with status 20. Before enrollment it installs no launchers, configuration, service, or shell hook, and it does not start or claim a tunnel.
 
 1. Enroll the printed public key in the intended remote account's `authorized_keys`.
 2. Rerun only after enrollment:
@@ -44,15 +44,15 @@ Do not reuse or download shared private keys. If any private key has been distri
 | `WSL_PROXY_HOST_FINGERPRINT` | empty | Optional pinned OpenSSH `SHA256:...` host-key fingerprint |
 | `WSL_PROXY_ENROLLED` | `0` | Must be `1` after public-key enrollment |
 
-Without a pinned fingerprint, SSH uses `StrictHostKeyChecking=accept-new`: first use is trusted and later changes are rejected. For stronger verification, obtain the server fingerprint over an independent trusted channel and set `WSL_PROXY_HOST_FINGERPRINT`. The bootstrap does not enable legacy `ssh-rsa` or `ssh-dss` algorithms.
+SSH always uses the tool-specific `~/.local/share/wsl-proxy/known_hosts` and disables the global/user default host-key files; it never changes `~/.ssh/known_hosts`. Without a pinned fingerprint, `StrictHostKeyChecking=accept-new` trusts first use and rejects later changes. With a fingerprint, the scanned key must match before it is atomically installed in the managed file and SSH starts. Obtain fingerprints over an independent trusted channel. The bootstrap does not enable legacy `ssh-rsa` or `ssh-dss` algorithms.
 
 ## Commands
 
 Ensure `$HOME/.local/bin` is in `PATH`, then use:
 
-- `proxy-on` — start the Linux-side SSH tunnel and wait for `127.0.0.1:1080`.
-- `proxy-off` — stop only the managed service/process.
-- `proxy-status` — report listener/service state.
+- `proxy-on` — start the Linux-side SSH tunnel, verify the owned SSH PID/start identity and command, confirm that PID owns `127.0.0.1:1080`, and complete a SOCKS5 handshake.
+- `proxy-off` — stop only a process whose recorded PID, start identity, per-start token, owner, and SSH command all match.
+- `proxy-status` — report only enrollment-gated, process-owned SOCKS5 readiness; unrelated listeners are unsafe, not ready.
 - `proxy-chrome [URL]` — start the tunnel, then launch Chrome with an isolated profile, SOCKS5 proxy, and resolver rules that prevent local DNS fallback.
 - `proxy-copy` — explicitly copy stdin through `clip.exe`, when WSL interop provides it.
 - `proxy-paste` — explicitly emit clipboard text through `powershell.exe`, when available.
@@ -61,9 +61,9 @@ Clipboard helpers run only when invoked. They do not log clipboard contents. No 
 
 ## Service behavior
 
-When systemd is PID 1 and the user manager works, the installer enables a `systemd --user` service. Otherwise it adds one clearly delimited managed block to `~/.bashrc`; interactive shells use that block only to ensure the Linux-side tunnel exists. Reruns replace that block rather than duplicating it.
+When systemd is PID 1 and the user manager works, the installer starts the `systemd --user` service without retries, verifies readiness, and only then enables it. Otherwise it verifies a tracked fallback process before adding one clearly delimited block to `~/.bashrc`. Failed or timed-out starts are stopped, disabled where applicable, and leave no fallback PID record or retry policy. Reruns replace the shell block rather than duplicating it.
 
-Before changing `~/.bashrc`, SSH proxy configuration, launchers, or the user service, the installer saves changed originals under `~/.local/share/wsl-proxy/backups/`. The isolated Chrome profile, logs, and dedicated key remain under the user's WSL home.
+Before each install lifecycle's first managed overwrite, the installer records every collision and copies its original into a validated deterministic manifest under `~/.local/share/wsl-proxy/originals-v1/`. Uninstall marks that lifecycle complete; a reinstall archives it and captures fresh originals, so intervening user files are not lost. Timestamped uninstall backups are separate. The isolated Chrome profile, logs, and dedicated key remain under the user's WSL home.
 
 ## Uninstall
 
@@ -73,17 +73,18 @@ From a clone of the repository:
 ./uninstall.sh
 ```
 
-Uninstall disables the managed service, stops only the recorded tunnel process, removes only the managed block/files, and saves removed files in a timestamped backup. It intentionally preserves keys, browser data, logs, and all backups. It does not remove system packages or the Google repository.
+Uninstall disables the managed service, stops only a fully validated recorded tunnel process, removes the managed shell block, and restores every collided file from the install-time manifest. Files that were originally absent are removed, while their current managed versions are saved in a timestamped uninstall backup. Keys, browser data, logs, manifests, and backups remain. Packages and the Google repository are unchanged.
 
 ## Security model
 
 - Refuses root execution and unsupported non-WSL/non-Debian systems.
 - Supports amd64 only, matching Google's Chrome Linux repository.
 - Installs Google's signing key into a dedicated APT keyring and uses `signed-by=`.
-- Binds SOCKS5 only to loopback and uses SSH batch mode, identity isolation, keepalives, and forward-failure detection.
+- Binds SOCKS5 only to loopback and uses a canonical root-owned, non-writable SSH executable with batch mode, identity isolation, keepalives, and forward-failure detection.
 - Uses a dedicated Ed25519 key and never downloads secret keys.
-- Requires explicit enrollment confirmation before any tunnel activation.
-- Makes no operational claim until `proxy-on` observes the local listener after an SSH start.
+- Requires explicit enrollment confirmation in both managed configuration and a matching enrollment gate before any tunnel activation.
+- Resolves every mutation path, rejects symlink traversal, and fails closed on Windows-backed filesystem types (including alternate mountpoints) before mutation.
+- Makes no operational claim until `proxy-on` validates process owner/identity/start token, listener ownership, and a real SOCKS5 handshake.
 - Uses a separate Chrome profile and forces name resolution through the SOCKS path.
 - Does not modify Windows-host files, create Windows automation, or broadly terminate processes.
 
@@ -96,7 +97,9 @@ sudo apt-get install shellcheck
 ./tests/test.sh
 ```
 
-The suite uses no WSL dependency, network, or live SSH server. It checks syntax, ShellCheck, root refusal, fake-`HOME` installation, enrollment stopping, idempotent managed blocks, reversible uninstall, clipboard behavior, and scans for host-mount writes, weak SSH algorithms, embedded private keys, probable credentials, and broad process termination.
+The suite uses no WSL dependency, network, or live SSH server. It checks syntax and ShellCheck; root refusal under root or non-root CI; pre-enrollment file gating; symlink and simulated alternate-mount escapes; idempotency; enrollment-gate enforcement; unrelated SOCKS listeners; stale PIDs; fallback/systemd failure cleanup; fingerprint mismatch; isolated known-hosts behavior; manifest restoration; clipboard behavior; and static security scans.
+
+`--internal-test-dry-run` is an explicit test-only seam: it prints a warning, forces package/network/service/tunnel startup and shell hooks off, and marks generated helpers permanently inert unless a test deliberately edits its disposable config. Persistent writes stay inside the supplied test `HOME`; temporary paths are separately mount-validated. `--internal-test-root-refusal` performs only a simulated uid-0 refusal. Neither option can silently relax a production installation.
 
 ## License
 

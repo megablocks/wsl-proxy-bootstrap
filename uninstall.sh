@@ -2,51 +2,89 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 (( EUID != 0 )) || { echo 'ERROR: do not run uninstall.sh as root.' >&2; exit 1; }
-[[ -n ${HOME:-} && $HOME == /* ]] || { echo 'ERROR: HOME must be an absolute Linux path.' >&2; exit 1; }
+[[ -n ${HOME:-} && $HOME == /* && $HOME != *$'\n'* && $HOME != *$'\r'* && $HOME != *$'\t'* ]] || { echo 'ERROR: HOME must be a safe absolute Linux path.' >&2; exit 1; }
 readonly MANAGED_BEGIN='# >>> wsl-proxy-bootstrap managed block >>>'
 readonly MANAGED_END='# <<< wsl-proxy-bootstrap managed block <<<'
+die() { echo "ERROR: $*" >&2; exit 1; }
+windows_fstype() { case $1 in drvfs|9p|cifs|smb3|ntfs|ntfs3|fuseblk|exfat|vfat) return 0 ;; *) return 1 ;; esac; }
+safe_path() {
+  local path=$1 part current=/ probe resolved info fstype source uid
+  [[ $path == /* ]] || return 1
+  IFS='/' read -r -a parts <<<"${path#/}"
+  for part in "${parts[@]}"; do [[ -n $part ]] || continue; current=${current%/}/$part; [[ ! -L $current ]] || return 1; done
+  probe=$path
+  while [[ ! -e $probe ]]; do [[ $probe != / ]] || break; probe=$(dirname -- "$probe"); done
+  resolved=$(readlink -f -- "$probe") || return 1
+  info=$(findmnt -T "$resolved" -n -o FSTYPE,SOURCE 2>/dev/null | head -n 1) || return 1
+  IFS=' ' read -r fstype source _ <<<"$info"
+  [[ -n $fstype ]] && ! windows_fstype "$fstype" && [[ ! ${source:-} =~ ^[A-Za-z]: ]] && [[ ${source:-} != //* ]] || return 1
+  if [[ -e $path ]]; then uid=$(stat -c %u -- "$path") || return 1; [[ $uid == "$EUID" ]] || return 1; fi
+}
+command -v findmnt >/dev/null || die 'findmnt is required for host-mount safety checks.'
 data_dir=$HOME/.local/share/wsl-proxy
+bin_dir=$HOME/.local/bin
+config_file=$HOME/.config/wsl-proxy/config
+enrollment_file=$data_dir/enrolled
+known_hosts=$data_dir/known_hosts
+service=$HOME/.config/systemd/user/wsl-proxy.service
+manifest=$data_dir/originals-v1/manifest
+originals_dir=$data_dir/originals-v1/files
+bashrc=$HOME/.bashrc
 backup_dir=$data_dir/backups/uninstall-$(date -u +%Y%m%dT%H%M%SZ)-$$
+declare -a ids=(config enrollment known_hosts common tunnel proxy_on proxy_off proxy_status proxy_chrome proxy_copy proxy_paste service)
+declare -a targets=("$config_file" "$enrollment_file" "$known_hosts" "$bin_dir/wsl-proxy-common" "$bin_dir/wsl-proxy-tunnel" "$bin_dir/proxy-on" "$bin_dir/proxy-off" "$bin_dir/proxy-status" "$bin_dir/proxy-chrome" "$bin_dir/proxy-copy" "$bin_dir/proxy-paste" "$service")
+validate_manifest() {
+  local id state lines
+  [[ -f $manifest && ! -L $manifest && $(head -n 1 "$manifest") == wsl-proxy-originals-v1 ]] || return 1
+  lines=$(wc -l <"$manifest")
+  [[ $lines == $((${#ids[@]} + 1)) ]] || return 1
+  for id in "${ids[@]}"; do
+    state=$(awk -F '\t' -v wanted="$id" '$1 == wanted { print $2; count++ } END { if (count != 1) exit 1 }' "$manifest") || return 1
+    case $state in present) [[ -f $originals_dir/$id && ! -L $originals_dir/$id ]] || return 1 ;; absent) ;; *) return 1 ;; esac
+  done
+}
+for path in "$HOME" "$data_dir" "$backup_dir" "$bashrc" "$manifest" "$originals_dir" "${targets[@]}"; do safe_path "$path" || die "Unsafe symlink or Windows-backed path detected: $path"; done
+validate_manifest || die 'A complete install-time originals manifest is required; nothing was changed.'
+if [[ -f $bashrc ]]; then
+  begin_count=$(grep -Fxc "$MANAGED_BEGIN" "$bashrc" || true)
+  end_count=$(grep -Fxc "$MANAGED_END" "$bashrc" || true)
+  [[ $begin_count == "$end_count" && $begin_count -le 1 ]] || die 'Malformed or duplicate managed markers; nothing was changed.'
+fi
+[[ -x $bin_dir/proxy-off && -x $bin_dir/wsl-proxy-common ]] || die 'Managed stop helpers are missing; refusing uninstall while tunnel state is unknown.'
+HOME=$HOME "$bin_dir/proxy-off" >/dev/null 2>&1 || die 'Could not safely stop the managed tunnel; nothing was restored.'
 mkdir -p "$backup_dir"
 chmod 700 "$data_dir" "$backup_dir"
-backup_and_remove() {
-  local target=$1 rel
+if command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then systemctl --user disable wsl-proxy.service >/dev/null 2>&1 || true; fi
+backup_current() {
+  local id=$1 target=$2
   [[ -e $target ]] || return 0
-  rel=${target#/}
-  mkdir -p "$backup_dir/$(dirname "$rel")"
-  cp -a "$target" "$backup_dir/$rel"
-  rm -f "$target"
+  cp -a -- "$target" "$backup_dir/$id"
 }
-service=$HOME/.config/systemd/user/wsl-proxy.service
-if command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then
-  systemctl --user disable --now wsl-proxy.service 2>/dev/null || true
-fi
-if [[ -x $HOME/.local/bin/proxy-off ]]; then "$HOME/.local/bin/proxy-off" >/dev/null || true; fi
-if [[ -f $HOME/.bashrc ]]; then
-  tmp=$(mktemp)
-  trap 'rm -f "$tmp"' EXIT
-  awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '
-    $0 == begin { managed=1; next }
-    $0 == end { managed=0; next }
-    !managed { print }
-  ' "$HOME/.bashrc" >"$tmp"
-  if ! cmp -s "$HOME/.bashrc" "$tmp"; then
-    mkdir -p "$backup_dir$HOME"
-    cp -a "$HOME/.bashrc" "$backup_dir$HOME/.bashrc"
-    cat "$tmp" >"$HOME/.bashrc"
-  fi
-fi
-for target in \
-  "$HOME/.local/bin/wsl-proxy-tunnel" \
-  "$HOME/.local/bin/proxy-on" \
-  "$HOME/.local/bin/proxy-off" \
-  "$HOME/.local/bin/proxy-status" \
-  "$HOME/.local/bin/proxy-chrome" \
-  "$HOME/.local/bin/proxy-copy" \
-  "$HOME/.local/bin/proxy-paste" \
-  "$HOME/.config/wsl-proxy/config" \
-  "$service"; do
-  backup_and_remove "$target"
+state_for() { awk -F '\t' -v wanted="$1" '$1 == wanted { print $2; found=1 } END { exit !found }' "$manifest"; }
+for i in "${!ids[@]}"; do
+  id=${ids[$i]}; target=${targets[$i]}
+  backup_current "$id" "$target"
+  state=$(state_for "$id") || die "Manifest lacks required entry: $id"
+  case $state in
+      present)
+        original=$originals_dir/$id
+        [[ -f $original && ! -L $original ]] || die "Install-time original is missing or unsafe: $id"
+        rm -f -- "$target"
+        mkdir -p "$(dirname -- "$target")"
+        cp -a -- "$original" "$target"
+        ;;
+      absent) rm -f -- "$target" ;;
+    *) die "Invalid manifest state for $id" ;;
+  esac
 done
+if [[ -f $bashrc ]]; then
+  tmp=$(mktemp "$backup_dir/.bashrc.XXXXXX")
+  trap 'rm -f "$tmp"' EXIT
+  awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '$0 == begin { managed=1; next } $0 == end { managed=0; next } !managed { print }' "$bashrc" >"$tmp"
+  if ! cmp -s "$bashrc" "$tmp"; then cp -a -- "$bashrc" "$backup_dir/bashrc"; cat "$tmp" >"$bashrc"; fi
+fi
+rm -f -- "$data_dir/tunnel.pid"
+touch "$data_dir/originals-v1/uninstalled"
+chmod 600 "$data_dir/originals-v1/uninstalled"
 if command -v systemctl >/dev/null && systemctl --user show-environment >/dev/null 2>&1; then systemctl --user daemon-reload; fi
-printf 'Uninstalled managed launchers/configuration. Keys, Chrome profile, logs, and all backups remain in place.\nBackup: %s\n' "$backup_dir"
+printf 'Uninstalled managed launchers/configuration and restored all collided install-time originals.\nKeys, profile, logs, manifests, and backups remain.\nBackup: %s\n' "$backup_dir"
