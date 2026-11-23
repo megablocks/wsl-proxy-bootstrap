@@ -363,19 +363,21 @@ exit 0
 FAKE
 chmod 755 "$fakebin/ssh-keyscan" "$fakebin/ssh"
 if (( EUID == 0 )); then chown "$test_user:$test_group" "$fakebin/ssh-keyscan" "$fakebin/ssh"; fi
-trusted_ssh=$(sed -n 's/^WSL_PROXY_SSH_BINARY=//p' "$home/.config/wsl-proxy/config")
 matching_fingerprint=$(ssh-keygen -lf "$tmp/hostkey.pub" -E sha256 | awk '{print $2}')
 chmod 600 "$home/.local/share/wsl-proxy/known_hosts"
 cp "$home/.local/share/wsl-proxy/known_hosts" "$tmp/known-hosts.before"
 known_hosts_backups_before=$(find "$home/.local/share/wsl-proxy/backups/pre-edit" -type f -name known_hosts | wc -l)
-uenv HOME="$home" sed -i "s|^WSL_PROXY_SSH_BINARY=.*|WSL_PROXY_SSH_BINARY=/usr/bin/true|; s|^WSL_PROXY_HOST_FINGERPRINT=.*|WSL_PROXY_HOST_FINGERPRINT=$matching_fingerprint|" "$home/.config/wsl-proxy/config"
-uenv HOME="$home" PATH="$fakebin:$PATH" KEYSCAN_FILE="$tmp/keyscan.line" "$home/.local/bin/wsl-proxy-tunnel" >/dev/null
+uenv HOME="$home" sed -i "s|^WSL_PROXY_HOST_FINGERPRINT=.*|WSL_PROXY_HOST_FINGERPRINT=$matching_fingerprint|" "$home/.config/wsl-proxy/config"
+set +e
+uenv HOME="$home" PATH="$fakebin:$PATH" KEYSCAN_FILE="$tmp/keyscan.line" "$home/.local/bin/wsl-proxy-tunnel" >/dev/null 2>&1
+pinned_runtime_rc=$?
+set -e
+[[ $pinned_runtime_rc != 0 ]] || fail 'pinned host-key fixture unexpectedly reached a live SSH server'
 known_hosts_backups_after=$(find "$home/.local/share/wsl-proxy/backups/pre-edit" -type f -name known_hosts | wc -l)
 [[ $known_hosts_backups_after == $((known_hosts_backups_before + 1)) ]] || fail 'successful pinned known_hosts replacement lacked one pre-edit backup'
 known_hosts_backup=$(find "$home/.local/share/wsl-proxy/backups/pre-edit" -type f -name known_hosts -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-)
 cmp -s "$tmp/known-hosts.before" "$known_hosts_backup" || fail 'known_hosts pre-edit backup was not exact'
 grep -Fxq "$keyscan_line" "$home/.local/share/wsl-proxy/known_hosts" || fail 'matching pinned host key was not atomically installed'
-uenv HOME="$home" sed -i "s|^WSL_PROXY_SSH_BINARY=.*|WSL_PROXY_SSH_BINARY=$trusted_ssh|" "$home/.config/wsl-proxy/config"
 pass 'successful managed known_hosts replacement creates a verified timestamped backup'
 uenv HOME="$home" sed -i 's|^WSL_PROXY_HOST_FINGERPRINT=.*|WSL_PROXY_HOST_FINGERPRINT=SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=|' "$home/.config/wsl-proxy/config"
 rm -f "$tmp/fingerprint-ssh-called"
