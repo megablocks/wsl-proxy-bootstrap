@@ -6,13 +6,17 @@ readonly MANAGED_BEGIN='# >>> wsl-proxy-bootstrap managed block >>>'
 readonly MANAGED_END='# <<< wsl-proxy-bootstrap managed block <<<'
 DRY_RUN=0
 INTERNAL_TEST=0
+INTERNAL_TEST_SHELL_HOOK=0
+INTERNAL_TEST_SHELL_CLEANUP=0
 ROOT_SELF_TEST=0
 for arg in "$@"; do
   case $arg in
     --dry-run) DRY_RUN=1 ;;
     --internal-test-dry-run) DRY_RUN=1; INTERNAL_TEST=1 ;;
+    --internal-test-shell-hook) DRY_RUN=1; INTERNAL_TEST=1; INTERNAL_TEST_SHELL_HOOK=1 ;;
+    --internal-test-shell-cleanup) DRY_RUN=1; INTERNAL_TEST=1; INTERNAL_TEST_SHELL_CLEANUP=1 ;;
     --internal-test-root-refusal) ROOT_SELF_TEST=1 ;;
-    *) printf 'Usage: %s [--dry-run | --internal-test-dry-run | --internal-test-root-refusal]\n' "$0" >&2; exit 64 ;;
+    *) printf 'Usage: %s [--dry-run | --internal-test-dry-run | --internal-test-shell-hook | --internal-test-shell-cleanup | --internal-test-root-refusal]\n' "$0" >&2; exit 64 ;;
   esac
 done
 (( $# <= 1 )) || { printf 'ERROR: options are mutually exclusive.\n' >&2; exit 64; }
@@ -56,6 +60,10 @@ pidfile=$data_dir/tunnel.pid
 logfile=$data_dir/tunnel.log
 manifest=$data_dir/originals-v1/manifest
 originals_dir=$data_dir/originals-v1/files
+preedit_root=$data_dir/backups/pre-edit
+bashrc_touched=$data_dir/originals-v1/bashrc-touched
+bashrc_original=$data_dir/originals-v1/bashrc-original
+bashrc_original_state=$data_dir/originals-v1/bashrc-original-state
 bashrc=$HOME/.bashrc
 service=$service_dir/wsl-proxy.service
 safe_tmp_root=${TMPDIR:-/tmp}
@@ -105,11 +113,11 @@ assert_safe_path "$HOME" HOME
 [[ -d $HOME ]] || die 'HOME must already exist as a directory.'
 assert_safe_path "$safe_tmp_root" "temporary directory $safe_tmp_root" 0
 [[ -d $safe_tmp_root ]] || die 'TMPDIR must already exist as a directory.'
-for dir in "$config_dir" "$bin_dir" "$data_dir" "$service_dir" "$(dirname -- "$SSH_KEY_PATH")" "$data_dir/originals-v1" "$originals_dir" "$data_dir/backups"; do
+for dir in "$config_dir" "$bin_dir" "$data_dir" "$service_dir" "$(dirname -- "$SSH_KEY_PATH")" "$data_dir/originals-v1" "$originals_dir" "$data_dir/backups" "$preedit_root"; do
   assert_safe_path "$dir" "target directory $dir"
   [[ ! -e $dir || -d $dir ]] || die "Target directory '$dir' is not a directory."
 done
-for target in "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub" "$data_dir/originals-v1/uninstalled" "$config_file" "$enrollment_file" "$known_hosts" "$pidfile" "$logfile" "$bashrc" "$service" \
+for target in "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub" "$data_dir/originals-v1/uninstalled" "$bashrc_touched" "$bashrc_original" "$bashrc_original_state" "$config_file" "$enrollment_file" "$known_hosts" "$pidfile" "$logfile" "$bashrc" "$service" \
   "$bin_dir/wsl-proxy-common" "$bin_dir/wsl-proxy-tunnel" "$bin_dir/proxy-on" "$bin_dir/proxy-off" "$bin_dir/proxy-status" "$bin_dir/proxy-chrome" "$bin_dir/proxy-copy" "$bin_dir/proxy-paste"; do
   assert_file_target "$target" "target file $target"
 done
@@ -238,6 +246,20 @@ wp_safe_path() {
   [[ -n $fstype ]] || return 1
   ! wp_windows_fstype "$fstype" && [[ ! ${source:-} =~ ^[A-Za-z]: ]] && [[ ${source:-} != //* ]]
 }
+wp_backup_before_edit() {
+  local id=$1 target=$2 root stamp backup_dir
+  [[ -f $target && ! -L $target ]] || { wp_die "Cannot back up unsafe managed file: $target"; return 1; }
+  root=$data_dir/backups/pre-edit
+  wp_safe_path "$root" || { wp_die 'Unsafe pre-edit backup path.'; return 1; }
+  mkdir -p "$root"
+  stamp=$(date -u +%Y%m%dT%H%M%S.%NZ)
+  backup_dir=$(mktemp -d "$root/$stamp-runtime-$$.XXXXXX")
+  chmod 700 "$root" "$backup_dir"
+  cp -a -- "$target" "$backup_dir/$id"
+  cmp -s "$target" "$backup_dir/$id" || { wp_die "Pre-edit backup verification failed for $target"; return 1; }
+  printf 'timestamp=%s\nid=%s\ntarget=%s\n' "$stamp" "$id" "$target" >"$backup_dir/metadata"
+  chmod 600 "$backup_dir/metadata"
+}
 wp_load_config() {
   local key value wp_path binary_uid binary_mode
   if ! wp_safe_path "$config" || [[ ! -f $config || -L $config ]]; then wp_die 'Unsafe or missing managed configuration.'; return 1; fi
@@ -265,7 +287,7 @@ wp_load_config() {
   if [[ $WSL_PROXY_TEST_INERT != 0 ]]; then wp_die 'This is an inert internal-test installation; production tunnel startup is disabled.'; return 1; fi
   if [[ $WSL_PROXY_ENROLLED != 1 ]]; then wp_die 'Enrollment has not been explicitly confirmed.'; return 1; fi
   if [[ ! -f $data_dir/enrolled || $(cat "$data_dir/enrolled") != "$WSL_PROXY_INSTALL_ID" ]]; then wp_die 'Enrollment gate is absent or does not match this installation.'; return 1; fi
-  for wp_path in "$HOME" "$data_dir" "$pidfile" "$known_hosts" "$data_dir/tunnel.log" "$data_dir/chrome-profile" "$WSL_PROXY_KEY_PATH" "$config" "$HOME/.local/bin"; do
+  for wp_path in "$HOME" "$data_dir" "$data_dir/backups/pre-edit" "$pidfile" "$known_hosts" "$data_dir/tunnel.log" "$data_dir/chrome-profile" "$WSL_PROXY_KEY_PATH" "$config" "$HOME/.local/bin"; do
     if ! wp_safe_path "$wp_path"; then wp_die "Unsafe path or Windows-backed mount detected: $wp_path"; return 1; fi
   done
   if [[ ! -x $WSL_PROXY_SSH_BINARY || -L $WSL_PROXY_SSH_BINARY ]] || ! wp_safe_path "$WSL_PROXY_SSH_BINARY"; then wp_die 'Configured ssh executable is missing or unsafe.'; return 1; fi
@@ -351,8 +373,13 @@ wp_load_config
 [[ -f $WSL_PROXY_KEY_PATH && ! -L $WSL_PROXY_KEY_PATH ]] || wp_die 'The configured private key is missing or unsafe.'
 mkdir -p "$data_dir"
 wp_safe_path "$known_hosts" || wp_die 'Unsafe known_hosts path.'
-touch "$known_hosts"
-chmod 600 "$known_hosts"
+if [[ -e $known_hosts ]]; then
+  known_hosts_mode=$(stat -c %a -- "$known_hosts") || wp_die 'Cannot inspect managed known_hosts.'
+  if [[ $known_hosts_mode != 600 ]]; then wp_backup_before_edit known_hosts "$known_hosts"; chmod 600 "$known_hosts"; fi
+else
+  : >"$known_hosts"
+  chmod 600 "$known_hosts"
+fi
 host_key_options=(-o StrictHostKeyChecking=accept-new)
 if [[ -n $WSL_PROXY_HOST_FINGERPRINT ]]; then
   scan=$(mktemp "$data_dir/.hostkey-scan.XXXXXX")
@@ -366,10 +393,15 @@ if [[ -n $WSL_PROXY_HOST_FINGERPRINT ]]; then
   done <"$scan"
   [[ -s $pinned ]] || wp_die 'SSH host fingerprint mismatch; refusing to connect.'
   chmod 600 "$pinned"
+  wp_backup_before_edit known_hosts "$known_hosts"
   mv -f "$pinned" "$known_hosts"
   rm -f "$scan" "$candidate"
   trap - EXIT
   host_key_options=(-o StrictHostKeyChecking=yes)
+else
+  # accept-new may append a first-seen host key, so preserve the exact prior file
+  # immediately before SSH receives permission to edit it.
+  wp_backup_before_edit known_hosts "$known_hosts"
 fi
 export WSL_PROXY_INSTALL_ID
 exec "$WSL_PROXY_SSH_BINARY" -NT -D "127.0.0.1:$local_port" -p "$WSL_PROXY_SSH_PORT" -i "$WSL_PROXY_KEY_PATH" \
@@ -526,7 +558,10 @@ Restart=no
 WantedBy=default.target
 UNIT
 
-# Capture originals once per install lifecycle, before the first overwrite.
+# Capture managed-target originals once per install lifecycle, before the first
+# overwrite. .bashrc has a separate lifecycle snapshot because it is edited only
+# on fallback systems and must not be rolled back when this lifecycle never
+# touched it.
 declare -a ids=(config enrollment known_hosts common tunnel proxy_on proxy_off proxy_status proxy_chrome proxy_copy proxy_paste service)
 declare -a targets=("$config_file" "$enrollment_file" "$known_hosts" "$bin_dir/wsl-proxy-common" "$bin_dir/wsl-proxy-tunnel" "$bin_dir/proxy-on" "$bin_dir/proxy-off" "$bin_dir/proxy-status" "$bin_dir/proxy-chrome" "$bin_dir/proxy-copy" "$bin_dir/proxy-paste" "$service")
 validate_manifest() {
@@ -563,39 +598,142 @@ else
   chmod 600 "$manifest_tmp"
   mv -f "$manifest_tmp" "$manifest"
 fi
-install_managed() {
-  local source=$1 target=$2 mode=$3
-  assert_file_target "$target" "managed target $target"
-  if [[ ! -e $target ]] || ! cmp -s "$source" "$target"; then install -m "$mode" "$source" "$target"; fi
+backup_counter=0
+backup_before_edit() {
+  local id=$1 target=$2 stamp backup_dir
+  [[ -e $target ]] || return 0
+  assert_file_target "$target" "pre-edit backup source $target"
+  stamp=$(date -u +%Y%m%dT%H%M%S.%NZ)
+  backup_counter=$((backup_counter + 1))
+  backup_dir=$preedit_root/$stamp-$$-$backup_counter
+  mkdir -p "$backup_dir"
+  chmod 700 "$preedit_root" "$backup_dir"
+  cp -a -- "$target" "$backup_dir/$id"
+  cmp -s "$target" "$backup_dir/$id" || die "Pre-edit backup verification failed for $target."
+  printf 'timestamp=%s\nid=%s\ntarget=%s\n' "$stamp" "$id" "$target" >"$backup_dir/metadata"
+  chmod 600 "$backup_dir/metadata"
 }
-install_managed "$tmpdir/config" "$config_file" 600
-install_managed "$tmpdir/wsl-proxy-common" "$bin_dir/wsl-proxy-common" 700
-for helper in wsl-proxy-tunnel proxy-on proxy-off proxy-status proxy-chrome proxy-copy proxy-paste; do install_managed "$tmpdir/$helper" "$bin_dir/$helper" 700; done
-install_managed "$tmpdir/wsl-proxy.service" "$service" 600
+capture_bashrc_original() {
+  local state staged state_tmp
+  if [[ -e $bashrc_touched ]]; then return 0; fi
+  if [[ -e $bashrc_original_state ]]; then
+    state=$(cat "$bashrc_original_state")
+    case $state in
+      present) [[ -f $bashrc_original && ! -L $bashrc_original ]] || die 'The lifecycle .bashrc original is incomplete.' ;;
+      absent) [[ ! -e $bashrc_original ]] || die 'The lifecycle .bashrc original state is inconsistent.' ;;
+      *) die 'The lifecycle .bashrc original state is invalid.' ;;
+    esac
+  else
+    if [[ -e $bashrc ]]; then
+      staged=$(mktemp "$data_dir/originals-v1/.bashrc-original.XXXXXX")
+      cp -a -- "$bashrc" "$staged"
+      cmp -s "$bashrc" "$staged" || { rm -f -- "$staged"; die 'Could not verify the lifecycle .bashrc original.'; }
+      mv -f -- "$staged" "$bashrc_original"
+      state=present
+    else
+      state=absent
+    fi
+    state_tmp=$(mktemp "$data_dir/originals-v1/.bashrc-state.XXXXXX")
+    printf '%s\n' "$state" >"$state_tmp"
+    chmod 600 "$state_tmp"
+    mv -f -- "$state_tmp" "$bashrc_original_state"
+  fi
+  touch "$bashrc_touched"
+  chmod 600 "$bashrc_touched"
+}
+atomic_install() {
+  local source=$1 target=$2 mode=$3 target_dir staged
+  target_dir=$(dirname -- "$target")
+  staged=$(mktemp "$target_dir/.wsl-proxy-install.XXXXXX")
+  if ! install -m "$mode" "$source" "$staged" || ! cmp -s "$source" "$staged"; then
+    rm -f -- "$staged"
+    die "Could not stage and validate managed target $target."
+  fi
+  if ! mv -f -- "$staged" "$target"; then
+    rm -f -- "$staged"
+    die "Could not atomically replace managed target $target."
+  fi
+}
+install_managed() {
+  local source=$1 target=$2 mode=$3 id=$4
+  assert_file_target "$target" "managed target $target"
+  if [[ ! -e $target ]] || ! cmp -s "$source" "$target"; then
+    backup_before_edit "$id" "$target"
+    atomic_install "$source" "$target" "$mode"
+  fi
+}
+install_managed "$tmpdir/config" "$config_file" 600 config
+install_managed "$tmpdir/wsl-proxy-common" "$bin_dir/wsl-proxy-common" 700 common
+install_managed "$tmpdir/wsl-proxy-tunnel" "$bin_dir/wsl-proxy-tunnel" 700 tunnel
+for helper in proxy-on proxy-off proxy-status proxy-chrome proxy-copy proxy-paste; do install_managed "$tmpdir/$helper" "$bin_dir/$helper" 700 "${helper//-/_}"; done
+install_managed "$tmpdir/wsl-proxy.service" "$service" 600 service
 printf '%s\n' "$install_id" >"$tmpdir/enrolled"
-install_managed "$tmpdir/enrolled" "$enrollment_file" 600
+install_managed "$tmpdir/enrolled" "$enrollment_file" 600 enrollment
 
 use_systemd=0
 if (( ! DRY_RUN )) && command -v systemctl >/dev/null && [[ $(cat /proc/1/comm 2>/dev/null || true) == systemd ]] && systemctl --user show-environment >/dev/null 2>&1; then use_systemd=1; fi
 add_shell_hook() {
-  touch "$bashrc"
-  awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '$0 == begin { managed=1; next } $0 == end { managed=0; next } !managed { print }' "$bashrc" >"$tmpdir/bashrc.clean"
-  { cat "$tmpdir/bashrc.clean"; printf '\n%s\n' "$MANAGED_BEGIN"; cat <<'BLOCK'
+  local source=/dev/null staged begin_count end_count
+  [[ -f $bashrc ]] && source=$bashrc
+  { printf '%s\n' "$MANAGED_BEGIN"; cat <<'BLOCK'
 # Start only the enrolled, verified Linux-side SSH tunnel in interactive shells.
 # Chrome and Windows programs are never auto-started.
 if [[ $- == *i* ]] && [[ -x $HOME/.local/bin/proxy-on ]]; then
   "$HOME/.local/bin/proxy-on" --quiet || true
 fi
 BLOCK
-    printf '%s\n' "$MANAGED_END"; } >"$tmpdir/bashrc.new"
-  if ! cmp -s "$bashrc" "$tmpdir/bashrc.new"; then cat "$tmpdir/bashrc.new" >"$bashrc"; fi
+    printf '%s\n' "$MANAGED_END"; } >"$tmpdir/bashrc.block"
+  if [[ -f $bashrc ]]; then
+    awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '$0 == begin { managed=1 } managed { print } $0 == end { managed=0 }' "$bashrc" >"$tmpdir/bashrc.current-block"
+    if cmp -s "$tmpdir/bashrc.block" "$tmpdir/bashrc.current-block"; then
+      bash -n "$bashrc" || die 'Existing managed .bashrc failed Bash syntax validation.'
+      return 0
+    fi
+  fi
+  awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '$0 == begin { managed=1; next } $0 == end { managed=0; next } !managed { print }' "$source" >"$tmpdir/bashrc.clean"
+  { cat "$tmpdir/bashrc.clean"; printf '\n'; cat "$tmpdir/bashrc.block"; } >"$tmpdir/bashrc.new"
+  begin_count=$(grep -Fxc "$MANAGED_BEGIN" "$tmpdir/bashrc.new" || true)
+  end_count=$(grep -Fxc "$MANAGED_END" "$tmpdir/bashrc.new" || true)
+  [[ $begin_count == 1 && $end_count == 1 ]] || die 'Generated .bashrc managed block failed marker validation.'
+  bash -n "$tmpdir/bashrc.new" || die 'Generated .bashrc failed Bash syntax validation.'
+  if [[ ! -e $bashrc ]] || ! cmp -s "$bashrc" "$tmpdir/bashrc.new"; then
+    capture_bashrc_original
+    backup_before_edit bashrc "$bashrc"
+    staged=$(mktemp "$(dirname -- "$bashrc")/.bashrc.wsl-proxy.XXXXXX")
+    if [[ -e $bashrc ]]; then
+      cp -a -- "$bashrc" "$staged" || { rm -f -- "$staged"; die 'Could not preserve .bashrc metadata on the staged replacement.'; }
+    else
+      chmod 644 "$staged"
+    fi
+    if ! cat "$tmpdir/bashrc.new" >"$staged" || ! cmp -s "$tmpdir/bashrc.new" "$staged" || ! bash -n "$staged"; then
+      rm -f -- "$staged"
+      die 'Could not stage and validate the .bashrc update.'
+    fi
+    if ! mv -f -- "$staged" "$bashrc"; then
+      rm -f -- "$staged"
+      die 'Could not atomically replace .bashrc; the original remains unchanged.'
+    fi
+  fi
 }
 remove_shell_hook() {
+  local staged
   [[ -f $bashrc ]] || return 0
   awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '$0 == begin { managed=1; next } $0 == end { managed=0; next } !managed { print }' "$bashrc" >"$tmpdir/bashrc.clean"
-  if ! cmp -s "$bashrc" "$tmpdir/bashrc.clean"; then cat "$tmpdir/bashrc.clean" >"$bashrc"; fi
+  if ! cmp -s "$bashrc" "$tmpdir/bashrc.clean"; then
+    # A lifecycle created by this release already has an exact original. An
+    # older lifecycle does not; do not mislabel its managed file as original.
+    [[ -e $bashrc_touched ]] && capture_bashrc_original
+    backup_before_edit bashrc "$bashrc"
+    staged=$(mktemp "$(dirname -- "$bashrc")/.bashrc.wsl-proxy.XXXXXX")
+    cp -a -- "$bashrc" "$staged" || { rm -f -- "$staged"; die 'Could not preserve .bashrc metadata on the staged cleanup.'; }
+    cat "$tmpdir/bashrc.clean" >"$staged"
+    cmp -s "$tmpdir/bashrc.clean" "$staged" || { rm -f -- "$staged"; die 'Could not validate staged .bashrc cleanup.'; }
+    mv -f -- "$staged" "$bashrc" || { rm -f -- "$staged"; die 'Could not atomically clean .bashrc.'; }
+  fi
 }
 if (( DRY_RUN )); then
+  if (( INTERNAL_TEST_SHELL_HOOK )); then add_shell_hook; fi
+  if (( INTERNAL_TEST_SHELL_CLEANUP )); then remove_shell_hook; fi
   info 'Dry run complete: files were written under HOME, but no service, tunnel, or auto-start hook was started.'
 elif (( use_systemd )); then
   "$bin_dir/proxy-off" >/dev/null || die 'Could not safely stop a previous managed fallback tunnel.'

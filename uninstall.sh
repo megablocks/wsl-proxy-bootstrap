@@ -29,6 +29,9 @@ known_hosts=$data_dir/known_hosts
 service=$HOME/.config/systemd/user/wsl-proxy.service
 manifest=$data_dir/originals-v1/manifest
 originals_dir=$data_dir/originals-v1/files
+bashrc_touched=$data_dir/originals-v1/bashrc-touched
+bashrc_original=$data_dir/originals-v1/bashrc-original
+bashrc_original_state=$data_dir/originals-v1/bashrc-original-state
 bashrc=$HOME/.bashrc
 backup_dir=$data_dir/backups/uninstall-$(date -u +%Y%m%dT%H%M%SZ)-$$
 declare -a ids=(config enrollment known_hosts common tunnel proxy_on proxy_off proxy_status proxy_chrome proxy_copy proxy_paste service)
@@ -43,8 +46,17 @@ validate_manifest() {
     case $state in present) [[ -f $originals_dir/$id && ! -L $originals_dir/$id ]] || return 1 ;; absent) ;; *) return 1 ;; esac
   done
 }
-for path in "$HOME" "$data_dir" "$backup_dir" "$bashrc" "$manifest" "$originals_dir" "${targets[@]}"; do safe_path "$path" || die "Unsafe symlink or Windows-backed path detected: $path"; done
+for path in "$HOME" "$data_dir" "$backup_dir" "$bashrc" "$bashrc_touched" "$bashrc_original" "$bashrc_original_state" "$manifest" "$originals_dir" "${targets[@]}"; do safe_path "$path" || die "Unsafe symlink or Windows-backed path detected: $path"; done
 validate_manifest || die 'A complete install-time originals manifest is required; nothing was changed.'
+if [[ -e $bashrc_touched ]]; then
+  [[ -f $bashrc_original_state && ! -L $bashrc_original_state ]] || die 'The lifecycle .bashrc state is missing; nothing was changed.'
+  bashrc_state=$(cat "$bashrc_original_state")
+  case $bashrc_state in
+    present) [[ -f $bashrc_original && ! -L $bashrc_original ]] || die 'The lifecycle .bashrc original is missing; nothing was changed.' ;;
+    absent) [[ ! -e $bashrc_original ]] || die 'The lifecycle .bashrc original state is inconsistent; nothing was changed.' ;;
+    *) die 'The lifecycle .bashrc state is invalid; nothing was changed.' ;;
+  esac
+fi
 if [[ -f $bashrc ]]; then
   begin_count=$(grep -Fxc "$MANAGED_BEGIN" "$bashrc" || true)
   end_count=$(grep -Fxc "$MANAGED_END" "$bashrc" || true)
@@ -61,6 +73,16 @@ backup_current() {
   cp -a -- "$target" "$backup_dir/$id"
 }
 state_for() { awk -F '\t' -v wanted="$1" '$1 == wanted { print $2; found=1 } END { exit !found }' "$manifest"; }
+atomic_restore() {
+  local source=$1 target=$2 target_dir staged
+  target_dir=$(dirname -- "$target")
+  mkdir -p "$target_dir"
+  staged=$(mktemp "$target_dir/.wsl-proxy-restore.XXXXXX")
+  rm -f -- "$staged"
+  cp -a -- "$source" "$staged"
+  cmp -s "$source" "$staged" || { rm -f -- "$staged"; die "Could not validate staged restore for $target"; }
+  mv -f -- "$staged" "$target" || { rm -f -- "$staged"; die "Could not atomically restore $target"; }
+}
 for i in "${!ids[@]}"; do
   id=${ids[$i]}; target=${targets[$i]}
   backup_current "$id" "$target"
@@ -69,19 +91,28 @@ for i in "${!ids[@]}"; do
       present)
         original=$originals_dir/$id
         [[ -f $original && ! -L $original ]] || die "Install-time original is missing or unsafe: $id"
-        rm -f -- "$target"
-        mkdir -p "$(dirname -- "$target")"
-        cp -a -- "$original" "$target"
+        atomic_restore "$original" "$target"
         ;;
       absent) rm -f -- "$target" ;;
     *) die "Invalid manifest state for $id" ;;
   esac
 done
-if [[ -f $bashrc ]]; then
-  tmp=$(mktemp "$backup_dir/.bashrc.XXXXXX")
+if [[ -e $bashrc_touched ]]; then
+  backup_current bashrc "$bashrc"
+  case $bashrc_state in
+    present) atomic_restore "$bashrc_original" "$bashrc" ;;
+    absent) rm -f -- "$bashrc" ;;
+  esac
+elif [[ -f $bashrc ]]; then
+  # Compatibility cleanup for lifecycles created before exact .bashrc snapshots.
+  tmp=$(mktemp "$(dirname -- "$bashrc")/.bashrc.wsl-proxy-uninstall.XXXXXX")
   trap 'rm -f "$tmp"' EXIT
+  cp -a -- "$bashrc" "$tmp" || die 'Could not preserve .bashrc metadata on the staged legacy cleanup.'
   awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '$0 == begin { managed=1; next } $0 == end { managed=0; next } !managed { print }' "$bashrc" >"$tmp"
-  if ! cmp -s "$bashrc" "$tmp"; then cp -a -- "$bashrc" "$backup_dir/bashrc"; cat "$tmp" >"$bashrc"; fi
+  if ! cmp -s "$bashrc" "$tmp"; then
+    backup_current bashrc "$bashrc"
+    mv -f -- "$tmp" "$bashrc" || die 'Could not atomically remove the legacy .bashrc block.'
+  fi
 fi
 rm -f -- "$data_dir/tunnel.pid"
 touch "$data_dir/originals-v1/uninstalled"
