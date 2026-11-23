@@ -410,12 +410,75 @@ cleanup_pids+=("$sleep_pid")
 sleep_start=$(sed 's/^[^)]*) //' "/proc/$sleep_pid/stat" | awk '{print $20}')
 printf 'PID=%s\nSTART=%s\nTOKEN=%s\n' "$sleep_pid" "$sleep_start" 00000000000000000000000000000000 >"$home/.local/share/wsl-proxy/tunnel.pid"
 if (( EUID == 0 )); then chown "$test_user:$test_group" "$home/.local/share/wsl-proxy/tunnel.pid"; fi
+set +e
 uenv HOME="$home" PATH="$fakebin:$PATH" "$home/.local/bin/proxy-off" >/dev/null
+stale_rc=$?
+set -e
+[[ $stale_rc != 0 ]] || fail 'live unverified stale PID record was treated as safely stopped'
 kill -0 "$sleep_pid" 2>/dev/null || fail 'proxy-off killed an unrelated process from stale PID data'
-[[ ! -e $home/.local/share/wsl-proxy/tunnel.pid ]] || fail 'stale PID record was not discarded'
+[[ -e $home/.local/share/wsl-proxy/tunnel.pid ]] || fail 'live unverified stale PID record was discarded'
+rm -f "$home/.local/share/wsl-proxy/tunnel.pid"
 kill "$sleep_pid" 2>/dev/null || true
 wait "$sleep_launcher" 2>/dev/null || true
-pass 'stale PID start/token/command validation preserves unrelated process'
+pass 'stale PID start/token validation preserves unrelated process and fails closed'
+
+# A valid fallback initializer may remain Bash while host-key preparation is in
+# progress. It must be tracked by its owner/start/token identity until it execs
+# SSH or exits, and every failure path must reap it and its exact PID record.
+uenv HOME="$home" sed -i 's|^WSL_PROXY_HOST_FINGERPRINT=.*|WSL_PROXY_HOST_FINGERPRINT=SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=|' "$home/.config/wsl-proxy/config"
+cat >"$fakebin/ssh-keyscan" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$PPID" >"$DELAYED_TUNNEL_PID"
+[[ -z ${DELAYED_SCAN_PID:-} ]] || printf '%s\n' "$$" >"$DELAYED_SCAN_PID"
+exec /bin/sleep "${DELAYED_SECONDS:-2}"
+FAKE
+chmod 755 "$fakebin/ssh-keyscan"
+if (( EUID == 0 )); then chown "$test_user:$test_group" "$fakebin/ssh-keyscan"; fi
+delayed_started=$(date +%s%N)
+set +e
+uenv HOME="$home" PATH="$fakebin:$PATH" DELAYED_TUNNEL_PID="$tmp/delayed-tunnel.pid" "$home/.local/bin/proxy-on" >/dev/null 2>&1
+delayed_rc=$?
+set -e
+delayed_elapsed_ms=$(( ($(date +%s%N) - delayed_started) / 1000000 ))
+[[ $delayed_rc != 0 ]] || fail 'delayed failing initializer reported success'
+[[ $delayed_elapsed_ms -ge 1000 ]] || fail 'proxy-on rejected a still-valid fallback initializer before its delayed setup completed'
+[[ -s $tmp/delayed-tunnel.pid ]] || fail 'delayed initializer did not publish its tunnel PID'
+delayed_pid=$(cat "$tmp/delayed-tunnel.pid")
+cleanup_pids+=("$delayed_pid")
+for _ in {1..50}; do kill -0 "$delayed_pid" 2>/dev/null || break; sleep 0.05; done
+! kill -0 "$delayed_pid" 2>/dev/null || fail 'failed delayed fallback left its initializer alive'
+[[ ! -e $home/.local/share/wsl-proxy/tunnel.pid ]] || fail 'failed delayed fallback left its managed PID record'
+rm -f "$tmp/delayed-tunnel.pid"
+set +e
+# shellcheck disable=SC2016
+uenv HOME="$home" PATH="$fakebin:$PATH" DELAYED_SECONDS=30 \
+  DELAYED_TUNNEL_PID="$tmp/signaled-tunnel.pid" DELAYED_SCAN_PID="$tmp/signaled-scan.pid" \
+  PROXY_CONTROL_PID="$tmp/signaled-proxy.pid" bash -c 'echo $$ >"$PROXY_CONTROL_PID"; exec "$HOME/.local/bin/proxy-on"' >/dev/null 2>&1 &
+signal_launcher=$!
+set -e
+cleanup_pids+=("$signal_launcher")
+for _ in {1..100}; do
+  [[ -s $tmp/signaled-proxy.pid && -s $tmp/signaled-tunnel.pid && -s $tmp/signaled-scan.pid ]] && break
+  sleep 0.05
+done
+[[ -s $tmp/signaled-proxy.pid && -s $tmp/signaled-tunnel.pid && -s $tmp/signaled-scan.pid ]] || fail 'signal fixture did not reach delayed initialization'
+signal_proxy_pid=$(cat "$tmp/signaled-proxy.pid")
+signal_tunnel_pid=$(cat "$tmp/signaled-tunnel.pid")
+signal_scan_pid=$(cat "$tmp/signaled-scan.pid")
+cleanup_pids+=("$signal_proxy_pid" "$signal_tunnel_pid" "$signal_scan_pid")
+kill -TERM "$signal_proxy_pid"
+set +e
+wait "$signal_launcher"
+signal_rc=$?
+set -e
+[[ $signal_rc != 0 ]] || fail 'signaled proxy-on reported success'
+for _ in {1..50}; do kill -0 "$signal_tunnel_pid" 2>/dev/null || break; sleep 0.05; done
+! kill -0 "$signal_tunnel_pid" 2>/dev/null || fail 'signal cleanup left the exact initializer alive'
+[[ ! -e $home/.local/share/wsl-proxy/tunnel.pid ]] || fail 'signal cleanup left its managed PID record'
+kill "$signal_scan_pid" 2>/dev/null || true
+uenv HOME="$home" sed -i 's|^WSL_PROXY_HOST_FINGERPRINT=.*|WSL_PROXY_HOST_FINGERPRINT=|' "$home/.config/wsl-proxy/config"
+rm -f "$fakebin/ssh-keyscan"
+pass 'delayed fallback initialization stays tracked and is cleaned on failure and signal'
 
 # Failed fallback connection must be cleaned up with no persistent process record.
 cat >"$fakebin/ssh" <<'FAKE'

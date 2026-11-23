@@ -147,7 +147,7 @@ for dir in "$config_dir" "$bin_dir" "$data_dir" "$service_dir" "$(dirname -- "$S
   assert_safe_path "$dir" "target directory $dir"
   [[ ! -e $dir || -d $dir ]] || die "Target directory '$dir' is not a directory."
 done
-for target in "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub" "$data_dir/originals-v1/uninstalled" "$bashrc_touched" "$bashrc_original" "$bashrc_original_state" "$config_file" "$enrollment_file" "$known_hosts" "$pidfile" "$logfile" "$bashrc" "$service" \
+for target in "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub" "$data_dir/originals-v1/uninstalled" "$bashrc_touched" "$bashrc_original" "$bashrc_original_state" "$config_file" "$enrollment_file" "$known_hosts" "$pidfile" "$data_dir/lifecycle.lock" "$logfile" "$bashrc" "$service" \
   "$bin_dir/wsl-proxy-common" "$bin_dir/wsl-proxy-tunnel" "$bin_dir/proxy-on" "$bin_dir/proxy-off" "$bin_dir/proxy-status" "$bin_dir/proxy-chrome" "$bin_dir/proxy-copy" "$bin_dir/proxy-paste"; do
   assert_file_target "$target" "target file $target"
 done
@@ -364,13 +364,21 @@ wp_load_config() {
   if [[ $WSL_PROXY_TEST_INERT != 0 ]]; then wp_die 'This is an inert internal-test installation; production tunnel startup is disabled.'; return 1; fi
   if [[ $WSL_PROXY_ENROLLED != 1 ]]; then wp_die 'Enrollment has not been explicitly confirmed.'; return 1; fi
   if [[ ! -f $data_dir/enrolled || $(cat "$data_dir/enrolled") != "$WSL_PROXY_INSTALL_ID" ]]; then wp_die 'Enrollment gate is absent or does not match this installation.'; return 1; fi
-  for wp_path in "$HOME" "$data_dir" "$data_dir/backups/pre-edit" "$pidfile" "$known_hosts" "$data_dir/tunnel.log" "$data_dir/chrome-profile" "$WSL_PROXY_KEY_PATH" "$config" "$HOME/.local/bin"; do
+  for wp_path in "$HOME" "$data_dir" "$data_dir/backups/pre-edit" "$pidfile" "$data_dir/lifecycle.lock" "$known_hosts" "$data_dir/tunnel.log" "$data_dir/chrome-profile" "$WSL_PROXY_KEY_PATH" "$config" "$HOME/.local/bin"; do
     if ! wp_safe_path "$wp_path"; then wp_die "Unsafe path or Windows-backed mount detected: $wp_path"; return 1; fi
   done
   if [[ ! -x $WSL_PROXY_SSH_BINARY || -L $WSL_PROXY_SSH_BINARY ]] || ! wp_safe_path "$WSL_PROXY_SSH_BINARY"; then wp_die 'Configured ssh executable is missing or unsafe.'; return 1; fi
   binary_uid=$(stat -c %u -- "$WSL_PROXY_SSH_BINARY") || return 1
   binary_mode=$(stat -c %a -- "$WSL_PROXY_SSH_BINARY") || return 1
   if [[ $binary_uid != 0 || $(( 8#$binary_mode & 022 )) != 0 ]]; then wp_die 'Configured ssh executable is not trusted.'; return 1; fi
+}
+wp_lock_lifecycle() {
+  command -v flock >/dev/null || { wp_die 'flock (util-linux) is required for safe lifecycle serialization.'; return 1; }
+  [[ ! -e $data_dir/lifecycle.lock || -f $data_dir/lifecycle.lock ]] || { wp_die 'Unsafe lifecycle lock path.'; return 1; }
+  # Append-open creates the lock without truncating an unexpected pre-existing
+  # regular file; the descriptor is used only by flock and never written.
+  exec 8>>"$data_dir/lifecycle.lock" || return 1
+  flock -x 8
 }
 wp_start_time() { sed 's/^[^)]*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'; }
 wp_env_has() { tr '\0' '\n' <"/proc/$1/environ" 2>/dev/null | grep -Fxq -- "$2"; }
@@ -396,22 +404,48 @@ wp_read_record() {
   [[ $WP_PID =~ ^[0-9]+$ && $WP_START =~ ^[0-9]+$ && $WP_TOKEN =~ ^[A-Fa-f0-9]{32}$ ]]
 }
 wp_record_valid() { wp_read_record && wp_process_expected "$WP_PID" "$WP_START" "$WP_TOKEN"; }
-wp_spawn_matches() {
-  local pid=$1 start=$2 token=$3
+wp_process_instance_matches() {
+  local pid=$1 start=$2
+  [[ $pid =~ ^[0-9]+$ && $start =~ ^[0-9]+$ ]] || return 1
   [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/stat ]] || return 1
   [[ $(stat -c %u "/proc/$pid") == "$EUID" ]] || return 1
-  [[ -z $start || $(wp_start_time "$pid") == "$start" ]] || return 1
+  [[ $(wp_start_time "$pid") == "$start" ]]
+}
+wp_spawn_matches() {
+  local pid=$1 start=$2 token=$3
+  [[ $token =~ ^[A-Fa-f0-9]{32}$ ]] || return 1
+  wp_process_instance_matches "$pid" "$start" || return 1
   wp_env_has "$pid" "WSL_PROXY_INSTANCE_TOKEN=$token"
+}
+wp_record_matches_spawn() {
+  local pid=$1 start=$2 token=$3
+  wp_read_record && [[ $WP_PID == "$pid" && $WP_START == "$start" && $WP_TOKEN == "$token" ]]
+}
+wp_remove_spawn_record() {
+  local pid=$1 start=$2 token=$3
+  if wp_record_matches_spawn "$pid" "$start" "$token"; then rm -f "$pidfile"; fi
 }
 wp_kill_spawn() {
   local pid=$1 start=$2 token=$3
-  if wp_spawn_matches "$pid" "$start" "$token"; then
-    kill "$pid" 2>/dev/null || true
-    for _ in {1..20}; do wp_spawn_matches "$pid" "$start" "$token" || return 0; sleep 0.05; done
-    kill -KILL "$pid" 2>/dev/null || return 1
-    for _ in {1..20}; do wp_spawn_matches "$pid" "$start" "$token" || return 0; sleep 0.05; done
-    return 1
+  if ! wp_spawn_matches "$pid" "$start" "$token"; then
+    wp_process_instance_matches "$pid" "$start" || return 0
+    # /proc/PID/environ can be momentarily unavailable while the launcher
+    # execs. Never mistake that transition for proof that cleanup succeeded.
+    for _ in {1..20}; do
+      wp_spawn_matches "$pid" "$start" "$token" && break
+      wp_process_instance_matches "$pid" "$start" || return 0
+      sleep 0.05
+    done
+    wp_spawn_matches "$pid" "$start" "$token" || return 1
   fi
+  kill "$pid" 2>/dev/null || true
+  for _ in {1..20}; do wp_process_instance_matches "$pid" "$start" || return 0; sleep 0.05; done
+  # Revalidate the secret token immediately before escalation so even an
+  # extreme same-PID/start-tick reuse race cannot receive SIGKILL.
+  wp_spawn_matches "$pid" "$start" "$token" || return 1
+  kill -KILL "$pid" 2>/dev/null || return 1
+  for _ in {1..20}; do wp_process_instance_matches "$pid" "$start" || return 0; sleep 0.05; done
+  return 1
 }
 wp_listener_owned() {
   local pid=$1
@@ -426,14 +460,25 @@ wp_ready_pid() { wp_process_expected "$1" "${2:-}" "${3:-}" && wp_listener_owned
 wp_systemd_pid() { systemctl --user show -p MainPID --value wsl-proxy.service 2>/dev/null || true; }
 wp_systemd_available() { [[ -f $service ]] && command -v systemctl >/dev/null && [[ $(cat /proc/1/comm 2>/dev/null || true) == systemd ]] && systemctl --user show-environment >/dev/null 2>&1; }
 wp_stop_recorded() {
-  if wp_record_valid; then
-    kill "$WP_PID" 2>/dev/null || true
-    for _ in {1..20}; do wp_process_expected "$WP_PID" "$WP_START" "$WP_TOKEN" || break; sleep 0.1; done
-    if wp_process_expected "$WP_PID" "$WP_START" "$WP_TOKEN"; then kill -KILL "$WP_PID" 2>/dev/null || return 1; fi
-    for _ in {1..20}; do wp_process_expected "$WP_PID" "$WP_START" "$WP_TOKEN" || break; sleep 0.05; done
-    wp_process_expected "$WP_PID" "$WP_START" "$WP_TOKEN" && return 1
+  local pid start token
+  if wp_read_record; then
+    pid=$WP_PID start=$WP_START token=$WP_TOKEN
+    if wp_process_instance_matches "$pid" "$start" && ! wp_spawn_matches "$pid" "$start" "$token"; then
+      for _ in {1..20}; do
+        wp_spawn_matches "$pid" "$start" "$token" && break
+        wp_process_instance_matches "$pid" "$start" || break
+        sleep 0.05
+      done
+    fi
+    if wp_spawn_matches "$pid" "$start" "$token"; then
+      wp_kill_spawn "$pid" "$start" "$token" || return 1
+      wp_process_instance_matches "$pid" "$start" && return 1
+    fi
+    wp_process_instance_matches "$pid" "$start" && return 1
+    wp_remove_spawn_record "$pid" "$start" "$token"
+  else
+    rm -f "$pidfile"
   fi
-  rm -f "$pidfile"
 }
 HELPER
 
@@ -501,9 +546,43 @@ local_port=1080
 # shellcheck disable=SC1091
 . "$HOME/.local/bin/wsl-proxy-common"
 wp_load_config
+wp_lock_lifecycle
 logfile=$data_dir/tunnel.log
 mode=process
 pid=
+start=
+token=
+record_tmp=
+cleanup_armed=0
+spawn_critical=0
+pending_signal=0
+cleanup_spawn() {
+  local cleanup_rc=0
+  (( cleanup_armed )) || return 0
+  if [[ ! $start =~ ^[0-9]+$ ]]; then
+    for _ in {1..20}; do start=$(wp_start_time "$pid" || true); [[ $start =~ ^[0-9]+$ ]] && break; sleep 0.05; done
+  fi
+  if [[ $start =~ ^[0-9]+$ ]]; then
+    wp_kill_spawn "$pid" "$start" "$token" || cleanup_rc=1
+    wp_process_instance_matches "$pid" "$start" && cleanup_rc=1
+    (( cleanup_rc )) || wp_remove_spawn_record "$pid" "$start" "$token"
+  else
+    cleanup_rc=1
+  fi
+  rm -f "${record_tmp:-}"
+  if (( cleanup_rc == 0 )); then cleanup_armed=0; fi
+  return "$cleanup_rc"
+}
+cleanup_spawn_on_exit() {
+  local status=$?
+  cleanup_spawn || echo 'ERROR: spawned tunnel process could not be stopped.' >&2
+  return "$status"
+}
+handle_spawn_signal() {
+  local status=$1
+  if (( spawn_critical )); then pending_signal=$status; return 0; fi
+  exit "$status"
+}
 if wp_systemd_available; then
   mode=systemd
   systemctl --user start wsl-proxy.service || {
@@ -512,18 +591,38 @@ if wp_systemd_available; then
     wp_die 'The managed systemd service failed to start.'
   }
 else
-  if wp_record_valid; then
-    pid=$WP_PID
+  spawn_critical=1
+  trap cleanup_spawn_on_exit EXIT
+  trap 'handle_spawn_signal 129' HUP
+  trap 'handle_spawn_signal 130' INT
+  trap 'handle_spawn_signal 143' TERM
+  recorded_spawn=0
+  if wp_read_record; then
+    pid=$WP_PID start=$WP_START token=$WP_TOKEN
+    if wp_process_instance_matches "$pid" "$start" && ! wp_spawn_matches "$pid" "$start" "$token"; then
+      for _ in {1..20}; do
+        wp_spawn_matches "$pid" "$start" "$token" && break
+        wp_process_instance_matches "$pid" "$start" || break
+        sleep 0.05
+      done
+    fi
+    if wp_spawn_matches "$pid" "$start" "$token"; then
+      recorded_spawn=1
+    elif wp_process_instance_matches "$pid" "$start"; then
+      wp_die 'The fallback PID record names a live process whose managed token cannot be verified.'
+    else
+      wp_remove_spawn_record "$pid" "$start" "$token"
+    fi
+  fi
+  if (( recorded_spawn )); then
+    cleanup_armed=1
   else
     rm -f "$pidfile"
     if wp_any_listener; then wp_die "Port 127.0.0.1:$local_port is occupied by an unrelated process."; fi
     token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
-    start=''
-    record_tmp=''
-    WSL_PROXY_INSTANCE_TOKEN=$token nohup "$HOME/.local/bin/wsl-proxy-tunnel" >>"$logfile" 2>&1 &
+    WSL_PROXY_INSTANCE_TOKEN=$token nohup "$HOME/.local/bin/wsl-proxy-tunnel" 8>&- >>"$logfile" 2>&1 &
     pid=$!
-    cleanup_spawn() { wp_kill_spawn "$pid" "$start" "$token" || echo 'ERROR: spawned tunnel process could not be stopped.' >&2; rm -f "${record_tmp:-}"; }
-    trap cleanup_spawn ERR EXIT INT TERM
+    cleanup_armed=1
     for _ in {1..20}; do start=$(wp_start_time "$pid" || true); [[ $start =~ ^[0-9]+$ ]] && break; sleep 0.05; done
     [[ $start =~ ^[0-9]+$ ]] || wp_die 'The SSH tunnel process exited before it could be identified.'
     record_tmp=$(mktemp "$data_dir/.tunnel.pid.XXXXXX")
@@ -532,6 +631,8 @@ else
     mv -f "$record_tmp" "$pidfile"
     record_tmp=''
   fi
+  spawn_critical=0
+  if (( pending_signal )); then exit "$pending_signal"; fi
 fi
 for _ in {1..30}; do
   if [[ $mode == systemd ]]; then
@@ -540,8 +641,15 @@ for _ in {1..30}; do
     if [[ $pid =~ ^[1-9][0-9]*$ && $systemd_start =~ ^[0-9]+$ ]] && wp_ready_pid "$pid" "$systemd_start"; then (( quiet )) || echo "Verified managed SOCKS5 proxy on 127.0.0.1:$local_port (systemd pid $pid)."; exit 0; fi
     systemctl --user is-active --quiet wsl-proxy.service || break
   else
-    if wp_record_valid && wp_ready_pid "$WP_PID" "$WP_START" "$WP_TOKEN"; then trap - ERR EXIT INT TERM; (( quiet )) || echo "Verified managed SOCKS5 proxy on 127.0.0.1:$local_port (pid $WP_PID)."; exit 0; fi
-    wp_process_expected "$pid" "${start:-}" "${token:-}" || break
+    if wp_record_matches_spawn "$pid" "$start" "$token" && wp_ready_pid "$pid" "$start" "$token"; then
+      cleanup_armed=0
+      trap - EXIT HUP INT TERM
+      (( quiet )) || echo "Verified managed SOCKS5 proxy on 127.0.0.1:$local_port (pid $pid)."
+      exit 0
+    fi
+    if ! wp_spawn_matches "$pid" "$start" "$token"; then
+      wp_process_instance_matches "$pid" "$start" || break
+    fi
   fi
   sleep 0.5
 done
@@ -549,9 +657,9 @@ if [[ $mode == systemd ]]; then
   systemctl --user disable --now wsl-proxy.service >/dev/null 2>&1 || true
   systemctl --user reset-failed wsl-proxy.service >/dev/null 2>&1 || true
 else
-  wp_stop_recorded || wp_die 'Failed to stop the managed fallback process.'
+  if ! cleanup_spawn; then wp_die 'Failed to stop the managed fallback process.'; fi
 fi
-trap - ERR EXIT INT TERM
+trap - EXIT HUP INT TERM
 wp_die 'The managed SSH tunnel did not pass process, listener-ownership, and SOCKS5 readiness checks; it was stopped and disabled.'
 HELPER
 
@@ -562,6 +670,7 @@ IFS=$'\n\t'
 # shellcheck disable=SC1091
 . "$HOME/.local/bin/wsl-proxy-common"
 wp_load_config || exit 1
+wp_lock_lifecycle || exit 1
 if wp_systemd_available; then
   systemd_pid=$(wp_systemd_pid)
   if [[ $systemd_pid =~ ^[1-9][0-9]*$ ]]; then
