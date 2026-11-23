@@ -436,17 +436,22 @@ chmod 755 "$fakebin/ssh-keyscan"
 if (( EUID == 0 )); then chown "$test_user:$test_group" "$fakebin/ssh-keyscan"; fi
 delayed_started=$(date +%s%N)
 set +e
-uenv HOME="$home" PATH="$fakebin:$PATH" DELAYED_TUNNEL_PID="$tmp/delayed-tunnel.pid" "$home/.local/bin/proxy-on" >/dev/null 2>&1
+uenv HOME="$home" PATH="$fakebin:$PATH" DELAYED_SECONDS=30 \
+  DELAYED_TUNNEL_PID="$tmp/delayed-tunnel.pid" DELAYED_SCAN_PID="$tmp/delayed-scan.pid" \
+  "$home/.local/bin/proxy-on" >/dev/null 2>&1
 delayed_rc=$?
 set -e
 delayed_elapsed_ms=$(( ($(date +%s%N) - delayed_started) / 1000000 ))
 [[ $delayed_rc != 0 ]] || fail 'delayed failing initializer reported success'
-[[ $delayed_elapsed_ms -ge 1000 ]] || fail 'proxy-on rejected a still-valid fallback initializer before its delayed setup completed'
-[[ -s $tmp/delayed-tunnel.pid ]] || fail 'delayed initializer did not publish its tunnel PID'
+[[ $delayed_elapsed_ms -ge 10000 ]] || fail 'proxy-on did not keep the delayed initializer alive through its readiness timeout'
+[[ -s $tmp/delayed-tunnel.pid && -s $tmp/delayed-scan.pid ]] || fail 'delayed initializer did not publish its tunnel and keyscan PIDs'
 delayed_pid=$(cat "$tmp/delayed-tunnel.pid")
-cleanup_pids+=("$delayed_pid")
+delayed_scan_pid=$(cat "$tmp/delayed-scan.pid")
+cleanup_pids+=("$delayed_pid" "$delayed_scan_pid")
 for _ in {1..50}; do kill -0 "$delayed_pid" 2>/dev/null || break; sleep 0.05; done
 ! kill -0 "$delayed_pid" 2>/dev/null || fail 'failed delayed fallback left its initializer alive'
+for _ in {1..50}; do kill -0 "$delayed_scan_pid" 2>/dev/null || break; sleep 0.05; done
+! kill -0 "$delayed_scan_pid" 2>/dev/null || fail 'timed-out fallback left its keyscan child alive'
 [[ ! -e $home/.local/share/wsl-proxy/tunnel.pid ]] || fail 'failed delayed fallback left its managed PID record'
 rm -f "$tmp/delayed-tunnel.pid"
 set +e
@@ -474,8 +479,9 @@ set -e
 [[ $signal_rc != 0 ]] || fail 'signaled proxy-on reported success'
 for _ in {1..50}; do kill -0 "$signal_tunnel_pid" 2>/dev/null || break; sleep 0.05; done
 ! kill -0 "$signal_tunnel_pid" 2>/dev/null || fail 'signal cleanup left the exact initializer alive'
+for _ in {1..50}; do kill -0 "$signal_scan_pid" 2>/dev/null || break; sleep 0.05; done
+! kill -0 "$signal_scan_pid" 2>/dev/null || fail 'signal cleanup left the exact keyscan child alive'
 [[ ! -e $home/.local/share/wsl-proxy/tunnel.pid ]] || fail 'signal cleanup left its managed PID record'
-kill "$signal_scan_pid" 2>/dev/null || true
 uenv HOME="$home" sed -i 's|^WSL_PROXY_HOST_FINGERPRINT=.*|WSL_PROXY_HOST_FINGERPRINT=|' "$home/.config/wsl-proxy/config"
 rm -f "$fakebin/ssh-keyscan"
 pass 'delayed fallback initialization stays tracked and is cleaned on failure and signal'

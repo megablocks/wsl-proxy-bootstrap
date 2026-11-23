@@ -507,8 +507,99 @@ if [[ -n $WSL_PROXY_HOST_FINGERPRINT ]]; then
   scan=$(mktemp "$data_dir/.hostkey-scan.XXXXXX")
   pinned=$(mktemp "$data_dir/.hostkey-pinned.XXXXXX")
   candidate=$(mktemp "$data_dir/.hostkey-candidate.XXXXXX")
-  trap 'rm -f "$scan" "$pinned" "$candidate"' EXIT
-  ssh-keyscan -T 10 -p "$WSL_PROXY_SSH_PORT" "$WSL_PROXY_SSH_HOST" >"$scan" 2>/dev/null || wp_die 'Unable to retrieve the SSH host key for pin verification.'
+  scan_pid=
+  scan_start=
+  scan_token=
+  scan_armed=0
+  scan_critical=0
+  scan_pending_signal=0
+  wp_scan_state() { sed 's/^[^)]*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $1}'; }
+  wp_reap_finished_scan() {
+    if ! wp_process_instance_matches "$scan_pid" "$scan_start"; then
+      wait "$scan_pid" 2>/dev/null || true
+      return 0
+    fi
+    if [[ $(wp_scan_state "$scan_pid") == Z ]]; then
+      wait "$scan_pid" 2>/dev/null || true
+      if wp_process_instance_matches "$scan_pid" "$scan_start"; then return 1; fi
+      return 0
+    fi
+    return 1
+  }
+  wp_cleanup_scan() {
+    local cleanup_rc=0
+    (( scan_armed )) || return 0
+    if [[ $scan_start =~ ^[0-9]+$ ]]; then
+      if wp_process_instance_matches "$scan_pid" "$scan_start" && ! wp_spawn_matches "$scan_pid" "$scan_start" "$scan_token"; then
+        # The child may be between fork and exec while its inherited token is
+        # not yet readable. Keep the exact PID/start identity fixed while retrying.
+        for _ in {1..20}; do
+          wp_spawn_matches "$scan_pid" "$scan_start" "$scan_token" && break
+          wp_process_instance_matches "$scan_pid" "$scan_start" || break
+          sleep 0.05
+        done
+      fi
+      if wp_spawn_matches "$scan_pid" "$scan_start" "$scan_token"; then
+        kill "$scan_pid" 2>/dev/null || true
+        for _ in {1..20}; do wp_reap_finished_scan && break; sleep 0.05; done
+        if wp_process_instance_matches "$scan_pid" "$scan_start"; then
+          # Validate owner, start time, and the private token again immediately
+          # before escalation. This must never target an unverified descendant.
+          if wp_spawn_matches "$scan_pid" "$scan_start" "$scan_token"; then
+            kill -KILL "$scan_pid" 2>/dev/null || cleanup_rc=1
+            wait "$scan_pid" 2>/dev/null || true
+          else
+            cleanup_rc=1
+          fi
+        fi
+        wp_process_instance_matches "$scan_pid" "$scan_start" && cleanup_rc=1
+      elif wp_process_instance_matches "$scan_pid" "$scan_start"; then
+        cleanup_rc=1
+      else
+        wait "$scan_pid" 2>/dev/null || true
+      fi
+    elif [[ -n $scan_pid ]]; then
+      # The launch is trap-protected until start capture. If the child already
+      # vanished, reaping is safe; a still-live unidentified child fails closed.
+      if kill -0 "$scan_pid" 2>/dev/null; then cleanup_rc=1; else wait "$scan_pid" 2>/dev/null || true; fi
+    fi
+    (( cleanup_rc )) || scan_armed=0
+    return "$cleanup_rc"
+  }
+  wp_cleanup_scan_on_exit() {
+    local status=$?
+    wp_cleanup_scan || echo 'ERROR: host-key scan process could not be stopped safely.' >&2
+    rm -f "$scan" "$pinned" "$candidate"
+    return "$status"
+  }
+  wp_handle_scan_signal() {
+    local status=$1
+    if (( scan_critical )); then scan_pending_signal=$status; return 0; fi
+    exit "$status"
+  }
+  trap wp_cleanup_scan_on_exit EXIT
+  trap 'wp_handle_scan_signal 129' HUP
+  trap 'wp_handle_scan_signal 130' INT
+  trap 'wp_handle_scan_signal 143' TERM
+  scan_token=${WSL_PROXY_INSTANCE_TOKEN:-}
+  if [[ ! $scan_token =~ ^[A-Fa-f0-9]{32}$ ]]; then scan_token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n'); fi
+  scan_critical=1
+  WSL_PROXY_INSTANCE_TOKEN=$scan_token ssh-keyscan -T 10 -p "$WSL_PROXY_SSH_PORT" "$WSL_PROXY_SSH_HOST" >"$scan" 2>/dev/null &
+  scan_pid=$!
+  scan_armed=1
+  for _ in {1..20}; do
+    scan_start=$(wp_start_time "$scan_pid" || true)
+    [[ $scan_start =~ ^[0-9]+$ ]] && break
+    kill -0 "$scan_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  scan_critical=0
+  if (( scan_pending_signal )); then exit "$scan_pending_signal"; fi
+  [[ $scan_start =~ ^[0-9]+$ ]] || { wait "$scan_pid" 2>/dev/null || true; scan_armed=0; wp_die 'Unable to identify the SSH host-key scan process.'; }
+  if wait "$scan_pid"; then scan_rc=0; else scan_rc=$?; fi
+  scan_armed=0
+  trap - HUP INT TERM
+  (( scan_rc == 0 )) || wp_die 'Unable to retrieve the SSH host key for pin verification.'
   while IFS= read -r key_line; do
     printf '%s\n' "$key_line" >"$candidate"
     if ssh-keygen -lf "$candidate" -E sha256 2>/dev/null | awk '{print $2}' | grep -Fxq "$WSL_PROXY_HOST_FINGERPRINT"; then printf '%s\n' "$key_line" >>"$pinned"; fi
