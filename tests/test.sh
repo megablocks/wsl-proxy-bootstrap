@@ -117,6 +117,83 @@ grep -q 'Windows-backed filesystem' <<<"$mount_out" || fail "mount refusal was n
 [[ ! -e $mount_home/hostmount/key ]] || fail 'mount safety check happened after mutation'
 pass 'filesystem-type check rejects alternate Windows-backed mounts before mutation'
 
+# A valid .bashrc can enable extglob at runtime before using it. Plain bash -n
+# rejects this because it does not execute shopt while parsing; the installer
+# must validate it with extglob enabled from parser startup.
+extglob_home=$tmp/extglob-home
+new_home "$extglob_home"
+cat >"$extglob_home/.bashrc" <<'BASHRC'
+shopt -s extglob
+case foo in
+  +(foo)) extglob_loaded=1 ;;
+esac
+BASHRC
+if (( EUID == 0 )); then chown "$test_user:$test_group" "$extglob_home/.bashrc"; fi
+set +e
+run_internal "$extglob_home" >/dev/null 2>&1
+extglob_enroll_rc=$?
+set -e
+[[ $extglob_enroll_rc == 20 ]] || fail 'runtime-extglob fixture did not reach enrollment'
+uenv HOME="$extglob_home" WSL_PROXY_ENROLLED=1 "$tmp/install.sh" --internal-test-shell-hook >/dev/null
+grep -q '^  +(foo)) extglob_loaded=1 ;;$' "$extglob_home/.bashrc" || fail 'runtime-extglob content was not preserved'
+[[ $(grep -Fc '# >>> wsl-proxy-bootstrap managed block >>>' "$extglob_home/.bashrc") == 1 ]] || fail 'runtime-extglob .bashrc did not receive exactly one shell hook'
+# shellcheck disable=SC2016
+uenv HOME="$extglob_home" bash -c 'source "$HOME/.bashrc"; [[ $extglob_loaded == 1 ]]' || fail 'runtime-extglob .bashrc did not execute successfully'
+extglob_hash_before=$(sha256sum "$extglob_home/.bashrc")
+extglob_inode_before=$(stat -c %i "$extglob_home/.bashrc")
+uenv HOME="$extglob_home" WSL_PROXY_ENROLLED=1 "$tmp/install.sh" --internal-test-shell-hook >/dev/null
+[[ $(sha256sum "$extglob_home/.bashrc") == "$extglob_hash_before" ]] || fail 'managed runtime-extglob .bashrc changed on idempotent validation'
+[[ $(stat -c %i "$extglob_home/.bashrc") == "$extglob_inode_before" ]] || fail 'managed runtime-extglob .bashrc was unnecessarily replaced'
+pass 'runtime-enabled extglob .bashrc passes candidate and staged validation'
+
+# Invalid syntax must fail before key generation or any existing managed
+# operational file is replaced, backed up, or incorporated into a manifest.
+invalid_home=$tmp/invalid-home
+new_home "$invalid_home"
+mkdir -p "$invalid_home/.config/wsl-proxy" "$invalid_home/.config/systemd/user" "$invalid_home/.local/bin"
+printf '%s\n' 'if [[ broken syntax' >"$invalid_home/.bashrc"
+printf '%s\n' 'sentinel config' >"$invalid_home/.config/wsl-proxy/config"
+printf '%s\n' 'sentinel helper' >"$invalid_home/.local/bin/proxy-on"
+printf '%s\n' 'sentinel service' >"$invalid_home/.config/systemd/user/wsl-proxy.service"
+if (( EUID == 0 )); then chown -R "$test_user:$test_group" "$invalid_home"; fi
+set +e
+invalid_out=$(uenv HOME="$invalid_home" WSL_PROXY_ENROLLED=1 "$tmp/install.sh" --internal-test-shell-hook 2>&1)
+invalid_rc=$?
+set -e
+[[ $invalid_rc != 0 ]] || fail 'invalid .bashrc syntax was accepted'
+grep -q 'no installation changes were made' <<<"$invalid_out" || fail 'invalid .bashrc failure did not report pre-mutation validation'
+[[ $(cat "$invalid_home/.config/wsl-proxy/config") == 'sentinel config' ]] || fail 'invalid .bashrc allowed config mutation'
+[[ $(cat "$invalid_home/.local/bin/proxy-on") == 'sentinel helper' ]] || fail 'invalid .bashrc allowed helper mutation'
+[[ $(cat "$invalid_home/.config/systemd/user/wsl-proxy.service") == 'sentinel service' ]] || fail 'invalid .bashrc allowed service mutation'
+[[ ! -e $invalid_home/.ssh/wsl-proxy_ed25519 ]] || fail 'invalid .bashrc allowed key generation'
+[[ ! -e $invalid_home/.local/share/wsl-proxy ]] || fail 'invalid .bashrc created managed state or backups'
+pass 'invalid .bashrc fails before any managed installation mutation'
+
+# Candidate construction errors must also fail closed. A read error must not be
+# masked by a syntactically valid block-only candidate.
+unreadable_home=$tmp/unreadable-home
+new_home "$unreadable_home"
+mkdir -p "$unreadable_home/.config/wsl-proxy" "$unreadable_home/.config/systemd/user" "$unreadable_home/.local/bin"
+printf '%s\n' '# unreadable original' >"$unreadable_home/.bashrc"
+printf '%s\n' 'sentinel config' >"$unreadable_home/.config/wsl-proxy/config"
+printf '%s\n' 'sentinel helper' >"$unreadable_home/.local/bin/proxy-on"
+printf '%s\n' 'sentinel service' >"$unreadable_home/.config/systemd/user/wsl-proxy.service"
+if (( EUID == 0 )); then chown -R "$test_user:$test_group" "$unreadable_home"; fi
+chmod 000 "$unreadable_home/.bashrc"
+set +e
+unreadable_out=$(uenv HOME="$unreadable_home" WSL_PROXY_ENROLLED=1 "$tmp/install.sh" --internal-test-shell-hook 2>&1)
+unreadable_rc=$?
+set -e
+[[ $unreadable_rc != 0 ]] || fail 'unreadable .bashrc candidate was accepted'
+grep -q 'Could not build the .bashrc shell-hook candidate' <<<"$unreadable_out" || fail 'unreadable .bashrc did not fail during candidate construction'
+[[ $(cat "$unreadable_home/.config/wsl-proxy/config") == 'sentinel config' ]] || fail 'unreadable .bashrc allowed config mutation'
+[[ $(cat "$unreadable_home/.local/bin/proxy-on") == 'sentinel helper' ]] || fail 'unreadable .bashrc allowed helper mutation'
+[[ $(cat "$unreadable_home/.config/systemd/user/wsl-proxy.service") == 'sentinel service' ]] || fail 'unreadable .bashrc allowed service mutation'
+[[ ! -e $unreadable_home/.ssh/wsl-proxy_ed25519 ]] || fail 'unreadable .bashrc allowed key generation'
+[[ ! -e $unreadable_home/.local/share/wsl-proxy ]] || fail 'unreadable .bashrc created managed state or backups'
+[[ $(stat -c %s "$unreadable_home/.bashrc") == 22 ]] || fail 'unreadable .bashrc content changed'
+pass 'unreadable .bashrc candidate fails closed before installation mutation'
+
 # A failed same-directory rename must leave .bashrc unchanged, after a verified
 # timestamped pre-edit backup has already been created.
 atomic_home=$tmp/atomic-home

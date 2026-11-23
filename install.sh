@@ -106,6 +106,37 @@ assert_file_target() {
   assert_safe_path "$path" "$label"
   [[ ! -e $path || -f $path ]] || die "$label exists but is not a regular file."
 }
+validate_bash_syntax() {
+  # bash -n does not execute an in-file "shopt -s extglob" before parsing
+  # later extended patterns. Enable extglob from parser startup so valid
+  # runtime .bashrc files are not rejected.
+  bash -O extglob -n "$1"
+}
+write_shell_hook_block() {
+  local output=$1
+  { printf '%s\n' "$MANAGED_BEGIN" || return 1
+    cat <<'BLOCK' || return 1
+# Start only the enrolled, verified Linux-side SSH tunnel in interactive shells.
+# Chrome and Windows programs are never auto-started.
+if [[ $- == *i* ]] && [[ -x $HOME/.local/bin/proxy-on ]]; then
+  "$HOME/.local/bin/proxy-on" --quiet || true
+fi
+BLOCK
+    printf '%s\n' "$MANAGED_END" || return 1
+  } >"$output" || return 1
+}
+build_shell_hook_candidate() {
+  local output=$1 block=$2 clean=$3 source=/dev/null begin_count end_count
+  [[ -f $bashrc ]] && source=$bashrc
+  awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '$0 == begin { managed=1; next } $0 == end { managed=0; next } !managed { print }' "$source" >"$clean" || return 1
+  { cat "$clean" || return 1
+    printf '\n' || return 1
+    cat "$block" || return 1
+  } >"$output" || return 1
+  begin_count=$(awk -v marker="$MANAGED_BEGIN" '$0 == marker { count++ } END { print count + 0 }' "$output") || return 1
+  end_count=$(awk -v marker="$MANAGED_END" '$0 == marker { count++ } END { print count + 0 }' "$output") || return 1
+  [[ $begin_count == 1 && $end_count == 1 ]]
+}
 
 # Validate every path that this installer or its generated helpers can mutate,
 # before APT, key generation, directory creation, backups, or service changes.
@@ -127,6 +158,21 @@ if [[ -f $bashrc ]]; then
   [[ $begin_count == "$end_count" && $begin_count -le 1 ]] || die 'Malformed or duplicate managed markers exist in .bashrc.'
   if (( begin_count == 1 )) && [[ ! -f $manifest ]]; then die 'Managed marker collision exists without an active install manifest.'; fi
 fi
+
+# Validate the exact shell-hook candidate before APT, key generation, manifest
+# creation, backups, or any managed operational-file replacement. This keeps an
+# invalid existing .bashrc from producing a partial installation.
+bashrc_preflight=$(mktemp -d -p "$safe_tmp_root" wsl-proxy-bashrc.XXXXXX)
+if ! write_shell_hook_block "$bashrc_preflight/block" ||
+   ! build_shell_hook_candidate "$bashrc_preflight/candidate" "$bashrc_preflight/block" "$bashrc_preflight/clean"; then
+  rm -rf -- "$bashrc_preflight"
+  die 'Could not build the .bashrc shell-hook candidate.'
+fi
+if ! validate_bash_syntax "$bashrc_preflight/candidate"; then
+  rm -rf -- "$bashrc_preflight"
+  die 'Generated .bashrc failed Bash syntax validation; no installation changes were made.'
+fi
+rm -rf -- "$bashrc_preflight"
 
 if (( ! INTERNAL_TEST )); then
   if ! grep -qiE '(microsoft|wsl)' /proc/sys/kernel/osrelease /proc/version 2>/dev/null && [[ -z ${WSL_INTEROP:-} ]]; then
@@ -673,29 +719,17 @@ install_managed "$tmpdir/enrolled" "$enrollment_file" 600 enrollment
 use_systemd=0
 if (( ! DRY_RUN )) && command -v systemctl >/dev/null && [[ $(cat /proc/1/comm 2>/dev/null || true) == systemd ]] && systemctl --user show-environment >/dev/null 2>&1; then use_systemd=1; fi
 add_shell_hook() {
-  local source=/dev/null staged begin_count end_count
-  [[ -f $bashrc ]] && source=$bashrc
-  { printf '%s\n' "$MANAGED_BEGIN"; cat <<'BLOCK'
-# Start only the enrolled, verified Linux-side SSH tunnel in interactive shells.
-# Chrome and Windows programs are never auto-started.
-if [[ $- == *i* ]] && [[ -x $HOME/.local/bin/proxy-on ]]; then
-  "$HOME/.local/bin/proxy-on" --quiet || true
-fi
-BLOCK
-    printf '%s\n' "$MANAGED_END"; } >"$tmpdir/bashrc.block"
+  local staged
+  write_shell_hook_block "$tmpdir/bashrc.block"
   if [[ -f $bashrc ]]; then
     awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '$0 == begin { managed=1 } managed { print } $0 == end { managed=0 }' "$bashrc" >"$tmpdir/bashrc.current-block"
     if cmp -s "$tmpdir/bashrc.block" "$tmpdir/bashrc.current-block"; then
-      bash -n "$bashrc" || die 'Existing managed .bashrc failed Bash syntax validation.'
+      validate_bash_syntax "$bashrc" || die 'Existing managed .bashrc failed Bash syntax validation.'
       return 0
     fi
   fi
-  awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '$0 == begin { managed=1; next } $0 == end { managed=0; next } !managed { print }' "$source" >"$tmpdir/bashrc.clean"
-  { cat "$tmpdir/bashrc.clean"; printf '\n'; cat "$tmpdir/bashrc.block"; } >"$tmpdir/bashrc.new"
-  begin_count=$(grep -Fxc "$MANAGED_BEGIN" "$tmpdir/bashrc.new" || true)
-  end_count=$(grep -Fxc "$MANAGED_END" "$tmpdir/bashrc.new" || true)
-  [[ $begin_count == 1 && $end_count == 1 ]] || die 'Generated .bashrc managed block failed marker validation.'
-  bash -n "$tmpdir/bashrc.new" || die 'Generated .bashrc failed Bash syntax validation.'
+  build_shell_hook_candidate "$tmpdir/bashrc.new" "$tmpdir/bashrc.block" "$tmpdir/bashrc.clean" || die 'Generated .bashrc managed block failed marker validation.'
+  validate_bash_syntax "$tmpdir/bashrc.new" || die 'Generated .bashrc failed Bash syntax validation.'
   if [[ ! -e $bashrc ]] || ! cmp -s "$bashrc" "$tmpdir/bashrc.new"; then
     capture_bashrc_original
     backup_before_edit bashrc "$bashrc"
@@ -705,7 +739,7 @@ BLOCK
     else
       chmod 644 "$staged"
     fi
-    if ! cat "$tmpdir/bashrc.new" >"$staged" || ! cmp -s "$tmpdir/bashrc.new" "$staged" || ! bash -n "$staged"; then
+    if ! cat "$tmpdir/bashrc.new" >"$staged" || ! cmp -s "$tmpdir/bashrc.new" "$staged" || ! validate_bash_syntax "$staged"; then
       rm -f -- "$staged"
       die 'Could not stage and validate the .bashrc update.'
     fi
