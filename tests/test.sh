@@ -146,6 +146,41 @@ uenv HOME="$extglob_home" WSL_PROXY_ENROLLED=1 "$tmp/install.sh" --internal-test
 [[ $(stat -c %i "$extglob_home/.bashrc") == "$extglob_inode_before" ]] || fail 'managed runtime-extglob .bashrc was unnecessarily replaced'
 pass 'runtime-enabled extglob .bashrc passes candidate and staged validation'
 
+# The pre-mutation candidate must be the candidate that is installed. If the
+# installer reconstructs it after managed-file writes, this awk wrapper fails
+# the second strip pass and exposes the partial-install ordering bug.
+retained_home=$tmp/retained-candidate-home
+new_home "$retained_home"
+printf '%s\n' '# retained candidate original' >"$retained_home/.bashrc"
+if (( EUID == 0 )); then chown "$test_user:$test_group" "$retained_home/.bashrc"; fi
+set +e
+run_internal "$retained_home" >/dev/null 2>&1
+retained_enroll_rc=$?
+set -e
+[[ $retained_enroll_rc == 20 ]] || fail 'retained-candidate fixture did not reach enrollment'
+candidate_bin=$tmp/candidate-bin
+mkdir -p "$candidate_bin"
+cat >"$candidate_bin/awk" <<'FAKE'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+case $* in
+  *'managed=1; next'*)
+    count=$(cat "$AWK_COUNT_FILE")
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$AWK_COUNT_FILE"
+    (( count == 1 )) || exit 91
+    ;;
+esac
+exec /usr/bin/awk "$@"
+FAKE
+chmod 755 "$candidate_bin/awk"
+printf '0\n' >"$tmp/candidate-awk-count"
+if (( EUID == 0 )); then chown -R "$test_user:$test_group" "$candidate_bin" "$tmp/candidate-awk-count"; fi
+uenv HOME="$retained_home" PATH="$candidate_bin:$PATH" AWK_COUNT_FILE="$tmp/candidate-awk-count" WSL_PROXY_ENROLLED=1 "$tmp/install.sh" --internal-test-shell-hook >/dev/null
+[[ $(cat "$tmp/candidate-awk-count") == 1 ]] || fail 'shell-hook candidate was rebuilt after preflight'
+[[ $(grep -Fc '# >>> wsl-proxy-bootstrap managed block >>>' "$retained_home/.bashrc") == 1 ]] || fail 'retained preflight candidate was not installed'
+pass 'validated preflight candidate is retained through managed-file installation'
+
 # Invalid syntax must fail before key generation or any existing managed
 # operational file is replaced, backed up, or incorporated into a manifest.
 invalid_home=$tmp/invalid-home
@@ -185,7 +220,7 @@ unreadable_out=$(uenv HOME="$unreadable_home" WSL_PROXY_ENROLLED=1 "$tmp/install
 unreadable_rc=$?
 set -e
 [[ $unreadable_rc != 0 ]] || fail 'unreadable .bashrc candidate was accepted'
-grep -q 'Could not build the .bashrc shell-hook candidate' <<<"$unreadable_out" || fail 'unreadable .bashrc did not fail during candidate construction'
+grep -q 'Could not read .bashrc while building the shell-hook candidate' <<<"$unreadable_out" || fail 'unreadable .bashrc did not fail during candidate construction'
 [[ $(cat "$unreadable_home/.config/wsl-proxy/config") == 'sentinel config' ]] || fail 'unreadable .bashrc allowed config mutation'
 [[ $(cat "$unreadable_home/.local/bin/proxy-on") == 'sentinel helper' ]] || fail 'unreadable .bashrc allowed helper mutation'
 [[ $(cat "$unreadable_home/.config/systemd/user/wsl-proxy.service") == 'sentinel service' ]] || fail 'unreadable .bashrc allowed service mutation'

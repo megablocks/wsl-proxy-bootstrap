@@ -126,8 +126,7 @@ BLOCK
   } >"$output" || return 1
 }
 build_shell_hook_candidate() {
-  local output=$1 block=$2 clean=$3 source=/dev/null begin_count end_count
-  [[ -f $bashrc ]] && source=$bashrc
+  local output=$1 block=$2 clean=$3 source=$4 begin_count end_count
   awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '$0 == begin { managed=1; next } $0 == end { managed=0; next } !managed { print }' "$source" >"$clean" || return 1
   { cat "$clean" || return 1
     printf '\n' || return 1
@@ -163,16 +162,48 @@ fi
 # creation, backups, or any managed operational-file replacement. This keeps an
 # invalid existing .bashrc from producing a partial installation.
 bashrc_preflight=$(mktemp -d -p "$safe_tmp_root" wsl-proxy-bashrc.XXXXXX)
+tmpdir=''
+key_tmp=''
+keyring_tmp=''
+cleanup_installer_temps() {
+  rm -rf -- "$bashrc_preflight"
+  [[ -z $tmpdir ]] || rm -rf -- "$tmpdir"
+  [[ -z $key_tmp ]] || rm -f -- "$key_tmp"
+  [[ -z $keyring_tmp ]] || rm -f -- "$keyring_tmp"
+}
+trap cleanup_installer_temps EXIT
+bashrc_preflight_state=absent
+if [[ -f $bashrc ]]; then
+  if ! cat -- "$bashrc" >"$bashrc_preflight/source"; then
+    die 'Could not read .bashrc while building the shell-hook candidate.'
+  fi
+  bashrc_preflight_state=present
+else
+  : >"$bashrc_preflight/source"
+fi
 if ! write_shell_hook_block "$bashrc_preflight/block" ||
-   ! build_shell_hook_candidate "$bashrc_preflight/candidate" "$bashrc_preflight/block" "$bashrc_preflight/clean"; then
+   ! build_shell_hook_candidate "$bashrc_preflight/candidate" "$bashrc_preflight/block" "$bashrc_preflight/clean" "$bashrc_preflight/source"; then
   rm -rf -- "$bashrc_preflight"
   die 'Could not build the .bashrc shell-hook candidate.'
 fi
-if ! validate_bash_syntax "$bashrc_preflight/candidate"; then
+if ! validate_bash_syntax "$bashrc_preflight/clean" || ! validate_bash_syntax "$bashrc_preflight/candidate"; then
   rm -rf -- "$bashrc_preflight"
   die 'Generated .bashrc failed Bash syntax validation; no installation changes were made.'
 fi
-rm -rf -- "$bashrc_preflight"
+bashrc_preflight_has_current_block=0
+if [[ $bashrc_preflight_state == present ]]; then
+  if ! awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '$0 == begin { managed=1 } managed { print } $0 == end { managed=0 }' "$bashrc_preflight/source" >"$bashrc_preflight/current-block"; then
+    die 'Could not inspect the existing .bashrc managed block.'
+  fi
+  if cmp -s "$bashrc_preflight/block" "$bashrc_preflight/current-block"; then bashrc_preflight_has_current_block=1; fi
+fi
+verify_bashrc_preflight() {
+  case $bashrc_preflight_state in
+    present) [[ -f $bashrc && ! -L $bashrc ]] && cmp -s "$bashrc_preflight/source" "$bashrc" ;;
+    absent) [[ ! -e $bashrc ]] ;;
+    *) return 1 ;;
+  esac
+}
 
 if (( ! INTERNAL_TEST )); then
   if ! grep -qiE '(microsoft|wsl)' /proc/sys/kernel/osrelease /proc/version 2>/dev/null && [[ -z ${WSL_INTEROP:-} ]]; then
@@ -196,7 +227,6 @@ if (( ! DRY_RUN )); then
   sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl gnupg openssh-client iproute2 util-linux coreutils
   key_tmp=$(mktemp -p "$safe_tmp_root")
   keyring_tmp=$(mktemp -p "$safe_tmp_root")
-  trap 'rm -f "${key_tmp:-}" "${keyring_tmp:-}"' EXIT
   curl --proto '=https' --tlsv1.2 -fsSL https://dl.google.com/linux/linux_signing_key.pub -o "$key_tmp"
   gpg --batch --yes --dearmor --output "$keyring_tmp" "$key_tmp"
   sudo install -m 0644 "$keyring_tmp" /usr/share/keyrings/google-chrome.gpg
@@ -204,7 +234,8 @@ if (( ! DRY_RUN )); then
   sudo apt-get update
   sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y google-chrome-stable
   rm -f "$key_tmp" "$keyring_tmp"
-  trap - EXIT
+  key_tmp=''
+  keyring_tmp=''
 else
   info 'Dry run: skipping package repositories, network access, sudo, and tunnel startup.'
 fi
@@ -241,11 +272,11 @@ if [[ $ENROLLED != 1 ]]; then
   exit 20
 fi
 
+verify_bashrc_preflight || die '.bashrc changed after preflight validation; rerun the installer.'
 mkdir -p "$config_dir" "$bin_dir" "$data_dir" "$service_dir" "$originals_dir"
 chmod 700 "$config_dir" "$data_dir" "$data_dir/originals-v1" "$originals_dir"
 
 tmpdir=$(mktemp -d -p "$safe_tmp_root")
-trap 'rm -rf "$tmpdir"' EXIT
 install_id=
 if [[ -r $config_file ]] && grep -q '^WSL_PROXY_INSTALL_ID=[A-Fa-f0-9]\{32\}$' "$config_file"; then
   install_id=$(sed -n 's/^WSL_PROXY_INSTALL_ID=//p' "$config_file" | head -n 1)
@@ -604,6 +635,8 @@ Restart=no
 WantedBy=default.target
 UNIT
 
+verify_bashrc_preflight || die '.bashrc changed after preflight validation; no managed operational files were replaced.'
+
 # Capture managed-target originals once per install lifecycle, before the first
 # overwrite. .bashrc has a separate lifecycle snapshot because it is edited only
 # on fallback systems and must not be rolled back when this lifecycle never
@@ -720,17 +753,8 @@ use_systemd=0
 if (( ! DRY_RUN )) && command -v systemctl >/dev/null && [[ $(cat /proc/1/comm 2>/dev/null || true) == systemd ]] && systemctl --user show-environment >/dev/null 2>&1; then use_systemd=1; fi
 add_shell_hook() {
   local staged
-  write_shell_hook_block "$tmpdir/bashrc.block"
-  if [[ -f $bashrc ]]; then
-    awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '$0 == begin { managed=1 } managed { print } $0 == end { managed=0 }' "$bashrc" >"$tmpdir/bashrc.current-block"
-    if cmp -s "$tmpdir/bashrc.block" "$tmpdir/bashrc.current-block"; then
-      validate_bash_syntax "$bashrc" || die 'Existing managed .bashrc failed Bash syntax validation.'
-      return 0
-    fi
-  fi
-  build_shell_hook_candidate "$tmpdir/bashrc.new" "$tmpdir/bashrc.block" "$tmpdir/bashrc.clean" || die 'Generated .bashrc managed block failed marker validation.'
-  validate_bash_syntax "$tmpdir/bashrc.new" || die 'Generated .bashrc failed Bash syntax validation.'
-  if [[ ! -e $bashrc ]] || ! cmp -s "$bashrc" "$tmpdir/bashrc.new"; then
+  if (( bashrc_preflight_has_current_block )); then return 0; fi
+  if [[ ! -e $bashrc ]] || ! cmp -s "$bashrc" "$bashrc_preflight/candidate"; then
     capture_bashrc_original
     backup_before_edit bashrc "$bashrc"
     staged=$(mktemp "$(dirname -- "$bashrc")/.bashrc.wsl-proxy.XXXXXX")
@@ -739,7 +763,7 @@ add_shell_hook() {
     else
       chmod 644 "$staged"
     fi
-    if ! cat "$tmpdir/bashrc.new" >"$staged" || ! cmp -s "$tmpdir/bashrc.new" "$staged" || ! validate_bash_syntax "$staged"; then
+    if ! cat "$bashrc_preflight/candidate" >"$staged" || ! cmp -s "$bashrc_preflight/candidate" "$staged" || ! validate_bash_syntax "$staged"; then
       rm -f -- "$staged"
       die 'Could not stage and validate the .bashrc update.'
     fi
@@ -752,16 +776,15 @@ add_shell_hook() {
 remove_shell_hook() {
   local staged
   [[ -f $bashrc ]] || return 0
-  awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '$0 == begin { managed=1; next } $0 == end { managed=0; next } !managed { print }' "$bashrc" >"$tmpdir/bashrc.clean"
-  if ! cmp -s "$bashrc" "$tmpdir/bashrc.clean"; then
+  if ! cmp -s "$bashrc" "$bashrc_preflight/clean"; then
     # A lifecycle created by this release already has an exact original. An
     # older lifecycle does not; do not mislabel its managed file as original.
     [[ -e $bashrc_touched ]] && capture_bashrc_original
     backup_before_edit bashrc "$bashrc"
     staged=$(mktemp "$(dirname -- "$bashrc")/.bashrc.wsl-proxy.XXXXXX")
     cp -a -- "$bashrc" "$staged" || { rm -f -- "$staged"; die 'Could not preserve .bashrc metadata on the staged cleanup.'; }
-    cat "$tmpdir/bashrc.clean" >"$staged"
-    cmp -s "$tmpdir/bashrc.clean" "$staged" || { rm -f -- "$staged"; die 'Could not validate staged .bashrc cleanup.'; }
+    cat "$bashrc_preflight/clean" >"$staged"
+    cmp -s "$bashrc_preflight/clean" "$staged" || { rm -f -- "$staged"; die 'Could not validate staged .bashrc cleanup.'; }
     mv -f -- "$staged" "$bashrc" || { rm -f -- "$staged"; die 'Could not atomically clean .bashrc.'; }
   fi
 }
