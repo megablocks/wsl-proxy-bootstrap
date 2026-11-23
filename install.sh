@@ -438,8 +438,13 @@ wp_kill_spawn() {
     done
     wp_spawn_matches "$pid" "$start" "$token" || return 1
   fi
-  kill "$pid" 2>/dev/null || true
-  for _ in {1..20}; do wp_process_instance_matches "$pid" "$start" || return 0; sleep 0.05; done
+  # The managed launcher may itself need up to three seconds to validate,
+  # TERM/KILL, and reap a TERM-resistant host-key scan. Give that nested
+  # cleanup a distinctly larger, but still bounded, five-second grace period.
+  # Revalidate the complete identity directly before both signals.
+  wp_spawn_matches "$pid" "$start" "$token" || return 1
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in {1..100}; do wp_process_instance_matches "$pid" "$start" || return 0; sleep 0.05; done
   # Revalidate the secret token immediately before escalation so even an
   # extreme same-PID/start-tick reuse race cannot receive SIGKILL.
   wp_spawn_matches "$pid" "$start" "$token" || return 1
@@ -540,14 +545,17 @@ if [[ -n $WSL_PROXY_HOST_FINGERPRINT ]]; then
         done
       fi
       if wp_spawn_matches "$scan_pid" "$scan_start" "$scan_token"; then
-        kill "$scan_pid" 2>/dev/null || true
+        # Validate owner, start time, and the private token immediately before
+        # each signal; never signal a child based only on stale captured state.
+        wp_spawn_matches "$scan_pid" "$scan_start" "$scan_token" || return 1
+        kill -TERM "$scan_pid" 2>/dev/null || true
         for _ in {1..20}; do wp_reap_finished_scan && break; sleep 0.05; done
         if wp_process_instance_matches "$scan_pid" "$scan_start"; then
           # Validate owner, start time, and the private token again immediately
           # before escalation. This must never target an unverified descendant.
           if wp_spawn_matches "$scan_pid" "$scan_start" "$scan_token"; then
             kill -KILL "$scan_pid" 2>/dev/null || cleanup_rc=1
-            wait "$scan_pid" 2>/dev/null || true
+            for _ in {1..20}; do wp_reap_finished_scan && break; sleep 0.05; done
           else
             cleanup_rc=1
           fi

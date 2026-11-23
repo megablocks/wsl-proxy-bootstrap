@@ -430,6 +430,8 @@ cat >"$fakebin/ssh-keyscan" <<'FAKE'
 #!/usr/bin/env bash
 printf '%s\n' "$PPID" >"$DELAYED_TUNNEL_PID"
 [[ -z ${DELAYED_SCAN_PID:-} ]] || printf '%s\n' "$$" >"$DELAYED_SCAN_PID"
+# Deliberately preserve SIG_IGN across exec so nested cleanup must escalate.
+trap '' TERM
 exec /bin/sleep "${DELAYED_SECONDS:-2}"
 FAKE
 chmod 755 "$fakebin/ssh-keyscan"
@@ -444,6 +446,7 @@ set -e
 delayed_elapsed_ms=$(( ($(date +%s%N) - delayed_started) / 1000000 ))
 [[ $delayed_rc != 0 ]] || fail 'delayed failing initializer reported success'
 [[ $delayed_elapsed_ms -ge 10000 ]] || fail 'proxy-on did not keep the delayed initializer alive through its readiness timeout'
+[[ $delayed_elapsed_ms -lt 25000 ]] || fail 'TERM-resistant timeout cleanup exceeded its bounded grace budget'
 [[ -s $tmp/delayed-tunnel.pid && -s $tmp/delayed-scan.pid ]] || fail 'delayed initializer did not publish its tunnel and keyscan PIDs'
 delayed_pid=$(cat "$tmp/delayed-tunnel.pid")
 delayed_scan_pid=$(cat "$tmp/delayed-scan.pid")
@@ -484,7 +487,7 @@ for _ in {1..50}; do kill -0 "$signal_scan_pid" 2>/dev/null || break; sleep 0.05
 [[ ! -e $home/.local/share/wsl-proxy/tunnel.pid ]] || fail 'signal cleanup left its managed PID record'
 uenv HOME="$home" sed -i 's|^WSL_PROXY_HOST_FINGERPRINT=.*|WSL_PROXY_HOST_FINGERPRINT=|' "$home/.config/wsl-proxy/config"
 rm -f "$fakebin/ssh-keyscan"
-pass 'delayed fallback initialization stays tracked and is cleaned on failure and signal'
+pass 'TERM-resistant fallback keyscan is reaped and unrecorded on timeout and active signal'
 
 # Failed fallback connection must be cleaned up with no persistent process record.
 cat >"$fakebin/ssh" <<'FAKE'
