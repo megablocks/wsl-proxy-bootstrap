@@ -6,13 +6,17 @@ readonly MANAGED_BEGIN='# >>> wsl-proxy-bootstrap managed block >>>'
 readonly MANAGED_END='# <<< wsl-proxy-bootstrap managed block <<<'
 DRY_RUN=0
 INTERNAL_TEST=0
+INTERNAL_TEST_SHELL_HOOK=0
+INTERNAL_TEST_SHELL_CLEANUP=0
 ROOT_SELF_TEST=0
 for arg in "$@"; do
   case $arg in
     --dry-run) DRY_RUN=1 ;;
     --internal-test-dry-run) DRY_RUN=1; INTERNAL_TEST=1 ;;
+    --internal-test-shell-hook) DRY_RUN=1; INTERNAL_TEST=1; INTERNAL_TEST_SHELL_HOOK=1 ;;
+    --internal-test-shell-cleanup) DRY_RUN=1; INTERNAL_TEST=1; INTERNAL_TEST_SHELL_CLEANUP=1 ;;
     --internal-test-root-refusal) ROOT_SELF_TEST=1 ;;
-    *) printf 'Usage: %s [--dry-run | --internal-test-dry-run | --internal-test-root-refusal]\n' "$0" >&2; exit 64 ;;
+    *) printf 'Usage: %s [--dry-run | --internal-test-dry-run | --internal-test-shell-hook | --internal-test-shell-cleanup | --internal-test-root-refusal]\n' "$0" >&2; exit 64 ;;
   esac
 done
 (( $# <= 1 )) || { printf 'ERROR: options are mutually exclusive.\n' >&2; exit 64; }
@@ -56,6 +60,10 @@ pidfile=$data_dir/tunnel.pid
 logfile=$data_dir/tunnel.log
 manifest=$data_dir/originals-v1/manifest
 originals_dir=$data_dir/originals-v1/files
+preedit_root=$data_dir/backups/pre-edit
+bashrc_touched=$data_dir/originals-v1/bashrc-touched
+bashrc_original=$data_dir/originals-v1/bashrc-original
+bashrc_original_state=$data_dir/originals-v1/bashrc-original-state
 bashrc=$HOME/.bashrc
 service=$service_dir/wsl-proxy.service
 safe_tmp_root=${TMPDIR:-/tmp}
@@ -98,6 +106,36 @@ assert_file_target() {
   assert_safe_path "$path" "$label"
   [[ ! -e $path || -f $path ]] || die "$label exists but is not a regular file."
 }
+validate_bash_syntax() {
+  # bash -n does not execute an in-file "shopt -s extglob" before parsing
+  # later extended patterns. Enable extglob from parser startup so valid
+  # runtime .bashrc files are not rejected.
+  bash -O extglob -n "$1"
+}
+write_shell_hook_block() {
+  local output=$1
+  { printf '%s\n' "$MANAGED_BEGIN" || return 1
+    cat <<'BLOCK' || return 1
+# Start only the enrolled, verified Linux-side SSH tunnel in interactive shells.
+# Chrome and Windows programs are never auto-started.
+if [[ $- == *i* ]] && [[ -x $HOME/.local/bin/proxy-on ]]; then
+  "$HOME/.local/bin/proxy-on" --quiet || true
+fi
+BLOCK
+    printf '%s\n' "$MANAGED_END" || return 1
+  } >"$output" || return 1
+}
+build_shell_hook_candidate() {
+  local output=$1 block=$2 clean=$3 source=$4 begin_count end_count
+  awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '$0 == begin { managed=1; next } $0 == end { managed=0; next } !managed { print }' "$source" >"$clean" || return 1
+  { cat "$clean" || return 1
+    printf '\n' || return 1
+    cat "$block" || return 1
+  } >"$output" || return 1
+  begin_count=$(awk -v marker="$MANAGED_BEGIN" '$0 == marker { count++ } END { print count + 0 }' "$output") || return 1
+  end_count=$(awk -v marker="$MANAGED_END" '$0 == marker { count++ } END { print count + 0 }' "$output") || return 1
+  [[ $begin_count == 1 && $end_count == 1 ]]
+}
 
 # Validate every path that this installer or its generated helpers can mutate,
 # before APT, key generation, directory creation, backups, or service changes.
@@ -105,11 +143,11 @@ assert_safe_path "$HOME" HOME
 [[ -d $HOME ]] || die 'HOME must already exist as a directory.'
 assert_safe_path "$safe_tmp_root" "temporary directory $safe_tmp_root" 0
 [[ -d $safe_tmp_root ]] || die 'TMPDIR must already exist as a directory.'
-for dir in "$config_dir" "$bin_dir" "$data_dir" "$service_dir" "$(dirname -- "$SSH_KEY_PATH")" "$data_dir/originals-v1" "$originals_dir" "$data_dir/backups"; do
+for dir in "$config_dir" "$bin_dir" "$data_dir" "$service_dir" "$(dirname -- "$SSH_KEY_PATH")" "$data_dir/originals-v1" "$originals_dir" "$data_dir/backups" "$preedit_root"; do
   assert_safe_path "$dir" "target directory $dir"
   [[ ! -e $dir || -d $dir ]] || die "Target directory '$dir' is not a directory."
 done
-for target in "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub" "$data_dir/originals-v1/uninstalled" "$config_file" "$enrollment_file" "$known_hosts" "$pidfile" "$logfile" "$bashrc" "$service" \
+for target in "$SSH_KEY_PATH" "$SSH_KEY_PATH.pub" "$data_dir/originals-v1/uninstalled" "$bashrc_touched" "$bashrc_original" "$bashrc_original_state" "$config_file" "$enrollment_file" "$known_hosts" "$pidfile" "$data_dir/lifecycle.lock" "$logfile" "$bashrc" "$service" \
   "$bin_dir/wsl-proxy-common" "$bin_dir/wsl-proxy-tunnel" "$bin_dir/proxy-on" "$bin_dir/proxy-off" "$bin_dir/proxy-status" "$bin_dir/proxy-chrome" "$bin_dir/proxy-copy" "$bin_dir/proxy-paste"; do
   assert_file_target "$target" "target file $target"
 done
@@ -119,6 +157,53 @@ if [[ -f $bashrc ]]; then
   [[ $begin_count == "$end_count" && $begin_count -le 1 ]] || die 'Malformed or duplicate managed markers exist in .bashrc.'
   if (( begin_count == 1 )) && [[ ! -f $manifest ]]; then die 'Managed marker collision exists without an active install manifest.'; fi
 fi
+
+# Validate the exact shell-hook candidate before APT, key generation, manifest
+# creation, backups, or any managed operational-file replacement. This keeps an
+# invalid existing .bashrc from producing a partial installation.
+bashrc_preflight=$(mktemp -d -p "$safe_tmp_root" wsl-proxy-bashrc.XXXXXX)
+tmpdir=''
+key_tmp=''
+keyring_tmp=''
+cleanup_installer_temps() {
+  rm -rf -- "$bashrc_preflight"
+  [[ -z $tmpdir ]] || rm -rf -- "$tmpdir"
+  [[ -z $key_tmp ]] || rm -f -- "$key_tmp"
+  [[ -z $keyring_tmp ]] || rm -f -- "$keyring_tmp"
+}
+trap cleanup_installer_temps EXIT
+bashrc_preflight_state=absent
+if [[ -f $bashrc ]]; then
+  if ! cat -- "$bashrc" >"$bashrc_preflight/source"; then
+    die 'Could not read .bashrc while building the shell-hook candidate.'
+  fi
+  bashrc_preflight_state=present
+else
+  : >"$bashrc_preflight/source"
+fi
+if ! write_shell_hook_block "$bashrc_preflight/block" ||
+   ! build_shell_hook_candidate "$bashrc_preflight/candidate" "$bashrc_preflight/block" "$bashrc_preflight/clean" "$bashrc_preflight/source"; then
+  rm -rf -- "$bashrc_preflight"
+  die 'Could not build the .bashrc shell-hook candidate.'
+fi
+if ! validate_bash_syntax "$bashrc_preflight/clean" || ! validate_bash_syntax "$bashrc_preflight/candidate"; then
+  rm -rf -- "$bashrc_preflight"
+  die 'Generated .bashrc failed Bash syntax validation; no installation changes were made.'
+fi
+bashrc_preflight_has_current_block=0
+if [[ $bashrc_preflight_state == present ]]; then
+  if ! awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '$0 == begin { managed=1 } managed { print } $0 == end { managed=0 }' "$bashrc_preflight/source" >"$bashrc_preflight/current-block"; then
+    die 'Could not inspect the existing .bashrc managed block.'
+  fi
+  if cmp -s "$bashrc_preflight/block" "$bashrc_preflight/current-block"; then bashrc_preflight_has_current_block=1; fi
+fi
+verify_bashrc_preflight() {
+  case $bashrc_preflight_state in
+    present) [[ -f $bashrc && ! -L $bashrc ]] && cmp -s "$bashrc_preflight/source" "$bashrc" ;;
+    absent) [[ ! -e $bashrc ]] ;;
+    *) return 1 ;;
+  esac
+}
 
 if (( ! INTERNAL_TEST )); then
   if ! grep -qiE '(microsoft|wsl)' /proc/sys/kernel/osrelease /proc/version 2>/dev/null && [[ -z ${WSL_INTEROP:-} ]]; then
@@ -142,7 +227,6 @@ if (( ! DRY_RUN )); then
   sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl gnupg openssh-client iproute2 util-linux coreutils
   key_tmp=$(mktemp -p "$safe_tmp_root")
   keyring_tmp=$(mktemp -p "$safe_tmp_root")
-  trap 'rm -f "${key_tmp:-}" "${keyring_tmp:-}"' EXIT
   curl --proto '=https' --tlsv1.2 -fsSL https://dl.google.com/linux/linux_signing_key.pub -o "$key_tmp"
   gpg --batch --yes --dearmor --output "$keyring_tmp" "$key_tmp"
   sudo install -m 0644 "$keyring_tmp" /usr/share/keyrings/google-chrome.gpg
@@ -150,7 +234,8 @@ if (( ! DRY_RUN )); then
   sudo apt-get update
   sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y google-chrome-stable
   rm -f "$key_tmp" "$keyring_tmp"
-  trap - EXIT
+  key_tmp=''
+  keyring_tmp=''
 else
   info 'Dry run: skipping package repositories, network access, sudo, and tunnel startup.'
 fi
@@ -187,11 +272,11 @@ if [[ $ENROLLED != 1 ]]; then
   exit 20
 fi
 
+verify_bashrc_preflight || die '.bashrc changed after preflight validation; rerun the installer.'
 mkdir -p "$config_dir" "$bin_dir" "$data_dir" "$service_dir" "$originals_dir"
 chmod 700 "$config_dir" "$data_dir" "$data_dir/originals-v1" "$originals_dir"
 
 tmpdir=$(mktemp -d -p "$safe_tmp_root")
-trap 'rm -rf "$tmpdir"' EXIT
 install_id=
 if [[ -r $config_file ]] && grep -q '^WSL_PROXY_INSTALL_ID=[A-Fa-f0-9]\{32\}$' "$config_file"; then
   install_id=$(sed -n 's/^WSL_PROXY_INSTALL_ID=//p' "$config_file" | head -n 1)
@@ -238,6 +323,20 @@ wp_safe_path() {
   [[ -n $fstype ]] || return 1
   ! wp_windows_fstype "$fstype" && [[ ! ${source:-} =~ ^[A-Za-z]: ]] && [[ ${source:-} != //* ]]
 }
+wp_backup_before_edit() {
+  local id=$1 target=$2 root stamp backup_dir
+  [[ -f $target && ! -L $target ]] || { wp_die "Cannot back up unsafe managed file: $target"; return 1; }
+  root=$data_dir/backups/pre-edit
+  wp_safe_path "$root" || { wp_die 'Unsafe pre-edit backup path.'; return 1; }
+  mkdir -p "$root"
+  stamp=$(date -u +%Y%m%dT%H%M%S.%NZ)
+  backup_dir=$(mktemp -d "$root/$stamp-runtime-$$.XXXXXX")
+  chmod 700 "$root" "$backup_dir"
+  cp -a -- "$target" "$backup_dir/$id"
+  cmp -s "$target" "$backup_dir/$id" || { wp_die "Pre-edit backup verification failed for $target"; return 1; }
+  printf 'timestamp=%s\nid=%s\ntarget=%s\n' "$stamp" "$id" "$target" >"$backup_dir/metadata"
+  chmod 600 "$backup_dir/metadata"
+}
 wp_load_config() {
   local key value wp_path binary_uid binary_mode
   if ! wp_safe_path "$config" || [[ ! -f $config || -L $config ]]; then wp_die 'Unsafe or missing managed configuration.'; return 1; fi
@@ -265,13 +364,21 @@ wp_load_config() {
   if [[ $WSL_PROXY_TEST_INERT != 0 ]]; then wp_die 'This is an inert internal-test installation; production tunnel startup is disabled.'; return 1; fi
   if [[ $WSL_PROXY_ENROLLED != 1 ]]; then wp_die 'Enrollment has not been explicitly confirmed.'; return 1; fi
   if [[ ! -f $data_dir/enrolled || $(cat "$data_dir/enrolled") != "$WSL_PROXY_INSTALL_ID" ]]; then wp_die 'Enrollment gate is absent or does not match this installation.'; return 1; fi
-  for wp_path in "$HOME" "$data_dir" "$pidfile" "$known_hosts" "$data_dir/tunnel.log" "$data_dir/chrome-profile" "$WSL_PROXY_KEY_PATH" "$config" "$HOME/.local/bin"; do
+  for wp_path in "$HOME" "$data_dir" "$data_dir/backups/pre-edit" "$pidfile" "$data_dir/lifecycle.lock" "$known_hosts" "$data_dir/tunnel.log" "$data_dir/chrome-profile" "$WSL_PROXY_KEY_PATH" "$config" "$HOME/.local/bin"; do
     if ! wp_safe_path "$wp_path"; then wp_die "Unsafe path or Windows-backed mount detected: $wp_path"; return 1; fi
   done
   if [[ ! -x $WSL_PROXY_SSH_BINARY || -L $WSL_PROXY_SSH_BINARY ]] || ! wp_safe_path "$WSL_PROXY_SSH_BINARY"; then wp_die 'Configured ssh executable is missing or unsafe.'; return 1; fi
   binary_uid=$(stat -c %u -- "$WSL_PROXY_SSH_BINARY") || return 1
   binary_mode=$(stat -c %a -- "$WSL_PROXY_SSH_BINARY") || return 1
   if [[ $binary_uid != 0 || $(( 8#$binary_mode & 022 )) != 0 ]]; then wp_die 'Configured ssh executable is not trusted.'; return 1; fi
+}
+wp_lock_lifecycle() {
+  command -v flock >/dev/null || { wp_die 'flock (util-linux) is required for safe lifecycle serialization.'; return 1; }
+  [[ ! -e $data_dir/lifecycle.lock || -f $data_dir/lifecycle.lock ]] || { wp_die 'Unsafe lifecycle lock path.'; return 1; }
+  # Append-open creates the lock without truncating an unexpected pre-existing
+  # regular file; the descriptor is used only by flock and never written.
+  exec 8>>"$data_dir/lifecycle.lock" || return 1
+  flock -x 8
 }
 wp_start_time() { sed 's/^[^)]*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'; }
 wp_env_has() { tr '\0' '\n' <"/proc/$1/environ" 2>/dev/null | grep -Fxq -- "$2"; }
@@ -297,22 +404,53 @@ wp_read_record() {
   [[ $WP_PID =~ ^[0-9]+$ && $WP_START =~ ^[0-9]+$ && $WP_TOKEN =~ ^[A-Fa-f0-9]{32}$ ]]
 }
 wp_record_valid() { wp_read_record && wp_process_expected "$WP_PID" "$WP_START" "$WP_TOKEN"; }
-wp_spawn_matches() {
-  local pid=$1 start=$2 token=$3
+wp_process_instance_matches() {
+  local pid=$1 start=$2
+  [[ $pid =~ ^[0-9]+$ && $start =~ ^[0-9]+$ ]] || return 1
   [[ $pid =~ ^[0-9]+$ && -r /proc/$pid/stat ]] || return 1
   [[ $(stat -c %u "/proc/$pid") == "$EUID" ]] || return 1
-  [[ -z $start || $(wp_start_time "$pid") == "$start" ]] || return 1
+  [[ $(wp_start_time "$pid") == "$start" ]]
+}
+wp_spawn_matches() {
+  local pid=$1 start=$2 token=$3
+  [[ $token =~ ^[A-Fa-f0-9]{32}$ ]] || return 1
+  wp_process_instance_matches "$pid" "$start" || return 1
   wp_env_has "$pid" "WSL_PROXY_INSTANCE_TOKEN=$token"
+}
+wp_record_matches_spawn() {
+  local pid=$1 start=$2 token=$3
+  wp_read_record && [[ $WP_PID == "$pid" && $WP_START == "$start" && $WP_TOKEN == "$token" ]]
+}
+wp_remove_spawn_record() {
+  local pid=$1 start=$2 token=$3
+  if wp_record_matches_spawn "$pid" "$start" "$token"; then rm -f "$pidfile"; fi
 }
 wp_kill_spawn() {
   local pid=$1 start=$2 token=$3
-  if wp_spawn_matches "$pid" "$start" "$token"; then
-    kill "$pid" 2>/dev/null || true
-    for _ in {1..20}; do wp_spawn_matches "$pid" "$start" "$token" || return 0; sleep 0.05; done
-    kill -KILL "$pid" 2>/dev/null || return 1
-    for _ in {1..20}; do wp_spawn_matches "$pid" "$start" "$token" || return 0; sleep 0.05; done
-    return 1
+  if ! wp_spawn_matches "$pid" "$start" "$token"; then
+    wp_process_instance_matches "$pid" "$start" || return 0
+    # /proc/PID/environ can be momentarily unavailable while the launcher
+    # execs. Never mistake that transition for proof that cleanup succeeded.
+    for _ in {1..20}; do
+      wp_spawn_matches "$pid" "$start" "$token" && break
+      wp_process_instance_matches "$pid" "$start" || return 0
+      sleep 0.05
+    done
+    wp_spawn_matches "$pid" "$start" "$token" || return 1
   fi
+  # The managed launcher may itself need up to three seconds to validate,
+  # TERM/KILL, and reap a TERM-resistant host-key scan. Give that nested
+  # cleanup a distinctly larger, but still bounded, five-second grace period.
+  # Revalidate the complete identity directly before both signals.
+  wp_spawn_matches "$pid" "$start" "$token" || return 1
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in {1..100}; do wp_process_instance_matches "$pid" "$start" || return 0; sleep 0.05; done
+  # Revalidate the secret token immediately before escalation so even an
+  # extreme same-PID/start-tick reuse race cannot receive SIGKILL.
+  wp_spawn_matches "$pid" "$start" "$token" || return 1
+  kill -KILL "$pid" 2>/dev/null || return 1
+  for _ in {1..20}; do wp_process_instance_matches "$pid" "$start" || return 0; sleep 0.05; done
+  return 1
 }
 wp_listener_owned() {
   local pid=$1
@@ -327,14 +465,25 @@ wp_ready_pid() { wp_process_expected "$1" "${2:-}" "${3:-}" && wp_listener_owned
 wp_systemd_pid() { systemctl --user show -p MainPID --value wsl-proxy.service 2>/dev/null || true; }
 wp_systemd_available() { [[ -f $service ]] && command -v systemctl >/dev/null && [[ $(cat /proc/1/comm 2>/dev/null || true) == systemd ]] && systemctl --user show-environment >/dev/null 2>&1; }
 wp_stop_recorded() {
-  if wp_record_valid; then
-    kill "$WP_PID" 2>/dev/null || true
-    for _ in {1..20}; do wp_process_expected "$WP_PID" "$WP_START" "$WP_TOKEN" || break; sleep 0.1; done
-    if wp_process_expected "$WP_PID" "$WP_START" "$WP_TOKEN"; then kill -KILL "$WP_PID" 2>/dev/null || return 1; fi
-    for _ in {1..20}; do wp_process_expected "$WP_PID" "$WP_START" "$WP_TOKEN" || break; sleep 0.05; done
-    wp_process_expected "$WP_PID" "$WP_START" "$WP_TOKEN" && return 1
+  local pid start token
+  if wp_read_record; then
+    pid=$WP_PID start=$WP_START token=$WP_TOKEN
+    if wp_process_instance_matches "$pid" "$start" && ! wp_spawn_matches "$pid" "$start" "$token"; then
+      for _ in {1..20}; do
+        wp_spawn_matches "$pid" "$start" "$token" && break
+        wp_process_instance_matches "$pid" "$start" || break
+        sleep 0.05
+      done
+    fi
+    if wp_spawn_matches "$pid" "$start" "$token"; then
+      wp_kill_spawn "$pid" "$start" "$token" || return 1
+      wp_process_instance_matches "$pid" "$start" && return 1
+    fi
+    wp_process_instance_matches "$pid" "$start" && return 1
+    wp_remove_spawn_record "$pid" "$start" "$token"
+  else
+    rm -f "$pidfile"
   fi
-  rm -f "$pidfile"
 }
 HELPER
 
@@ -351,25 +500,129 @@ wp_load_config
 [[ -f $WSL_PROXY_KEY_PATH && ! -L $WSL_PROXY_KEY_PATH ]] || wp_die 'The configured private key is missing or unsafe.'
 mkdir -p "$data_dir"
 wp_safe_path "$known_hosts" || wp_die 'Unsafe known_hosts path.'
-touch "$known_hosts"
-chmod 600 "$known_hosts"
+if [[ -e $known_hosts ]]; then
+  known_hosts_mode=$(stat -c %a -- "$known_hosts") || wp_die 'Cannot inspect managed known_hosts.'
+  if [[ $known_hosts_mode != 600 ]]; then wp_backup_before_edit known_hosts "$known_hosts"; chmod 600 "$known_hosts"; fi
+else
+  : >"$known_hosts"
+  chmod 600 "$known_hosts"
+fi
 host_key_options=(-o StrictHostKeyChecking=accept-new)
 if [[ -n $WSL_PROXY_HOST_FINGERPRINT ]]; then
   scan=$(mktemp "$data_dir/.hostkey-scan.XXXXXX")
   pinned=$(mktemp "$data_dir/.hostkey-pinned.XXXXXX")
   candidate=$(mktemp "$data_dir/.hostkey-candidate.XXXXXX")
-  trap 'rm -f "$scan" "$pinned" "$candidate"' EXIT
-  ssh-keyscan -T 10 -p "$WSL_PROXY_SSH_PORT" "$WSL_PROXY_SSH_HOST" >"$scan" 2>/dev/null || wp_die 'Unable to retrieve the SSH host key for pin verification.'
+  scan_pid=
+  scan_start=
+  scan_token=
+  scan_armed=0
+  scan_critical=0
+  scan_pending_signal=0
+  wp_scan_state() { sed 's/^[^)]*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $1}'; }
+  wp_reap_finished_scan() {
+    if ! wp_process_instance_matches "$scan_pid" "$scan_start"; then
+      wait "$scan_pid" 2>/dev/null || true
+      return 0
+    fi
+    if [[ $(wp_scan_state "$scan_pid") == Z ]]; then
+      wait "$scan_pid" 2>/dev/null || true
+      if wp_process_instance_matches "$scan_pid" "$scan_start"; then return 1; fi
+      return 0
+    fi
+    return 1
+  }
+  wp_cleanup_scan() {
+    local cleanup_rc=0
+    (( scan_armed )) || return 0
+    if [[ $scan_start =~ ^[0-9]+$ ]]; then
+      if wp_process_instance_matches "$scan_pid" "$scan_start" && ! wp_spawn_matches "$scan_pid" "$scan_start" "$scan_token"; then
+        # The child may be between fork and exec while its inherited token is
+        # not yet readable. Keep the exact PID/start identity fixed while retrying.
+        for _ in {1..20}; do
+          wp_spawn_matches "$scan_pid" "$scan_start" "$scan_token" && break
+          wp_process_instance_matches "$scan_pid" "$scan_start" || break
+          sleep 0.05
+        done
+      fi
+      if wp_spawn_matches "$scan_pid" "$scan_start" "$scan_token"; then
+        # Validate owner, start time, and the private token immediately before
+        # each signal; never signal a child based only on stale captured state.
+        wp_spawn_matches "$scan_pid" "$scan_start" "$scan_token" || return 1
+        kill -TERM "$scan_pid" 2>/dev/null || true
+        for _ in {1..20}; do wp_reap_finished_scan && break; sleep 0.05; done
+        if wp_process_instance_matches "$scan_pid" "$scan_start"; then
+          # Validate owner, start time, and the private token again immediately
+          # before escalation. This must never target an unverified descendant.
+          if wp_spawn_matches "$scan_pid" "$scan_start" "$scan_token"; then
+            kill -KILL "$scan_pid" 2>/dev/null || cleanup_rc=1
+            for _ in {1..20}; do wp_reap_finished_scan && break; sleep 0.05; done
+          else
+            cleanup_rc=1
+          fi
+        fi
+        wp_process_instance_matches "$scan_pid" "$scan_start" && cleanup_rc=1
+      elif wp_process_instance_matches "$scan_pid" "$scan_start"; then
+        cleanup_rc=1
+      else
+        wait "$scan_pid" 2>/dev/null || true
+      fi
+    elif [[ -n $scan_pid ]]; then
+      # The launch is trap-protected until start capture. If the child already
+      # vanished, reaping is safe; a still-live unidentified child fails closed.
+      if kill -0 "$scan_pid" 2>/dev/null; then cleanup_rc=1; else wait "$scan_pid" 2>/dev/null || true; fi
+    fi
+    (( cleanup_rc )) || scan_armed=0
+    return "$cleanup_rc"
+  }
+  wp_cleanup_scan_on_exit() {
+    local status=$?
+    wp_cleanup_scan || echo 'ERROR: host-key scan process could not be stopped safely.' >&2
+    rm -f "$scan" "$pinned" "$candidate"
+    return "$status"
+  }
+  wp_handle_scan_signal() {
+    local status=$1
+    if (( scan_critical )); then scan_pending_signal=$status; return 0; fi
+    exit "$status"
+  }
+  trap wp_cleanup_scan_on_exit EXIT
+  trap 'wp_handle_scan_signal 129' HUP
+  trap 'wp_handle_scan_signal 130' INT
+  trap 'wp_handle_scan_signal 143' TERM
+  scan_token=${WSL_PROXY_INSTANCE_TOKEN:-}
+  if [[ ! $scan_token =~ ^[A-Fa-f0-9]{32}$ ]]; then scan_token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n'); fi
+  scan_critical=1
+  WSL_PROXY_INSTANCE_TOKEN=$scan_token ssh-keyscan -T 10 -p "$WSL_PROXY_SSH_PORT" "$WSL_PROXY_SSH_HOST" >"$scan" 2>/dev/null &
+  scan_pid=$!
+  scan_armed=1
+  for _ in {1..20}; do
+    scan_start=$(wp_start_time "$scan_pid" || true)
+    [[ $scan_start =~ ^[0-9]+$ ]] && break
+    kill -0 "$scan_pid" 2>/dev/null || break
+    sleep 0.05
+  done
+  scan_critical=0
+  if (( scan_pending_signal )); then exit "$scan_pending_signal"; fi
+  [[ $scan_start =~ ^[0-9]+$ ]] || { wait "$scan_pid" 2>/dev/null || true; scan_armed=0; wp_die 'Unable to identify the SSH host-key scan process.'; }
+  if wait "$scan_pid"; then scan_rc=0; else scan_rc=$?; fi
+  scan_armed=0
+  trap - HUP INT TERM
+  (( scan_rc == 0 )) || wp_die 'Unable to retrieve the SSH host key for pin verification.'
   while IFS= read -r key_line; do
     printf '%s\n' "$key_line" >"$candidate"
     if ssh-keygen -lf "$candidate" -E sha256 2>/dev/null | awk '{print $2}' | grep -Fxq "$WSL_PROXY_HOST_FINGERPRINT"; then printf '%s\n' "$key_line" >>"$pinned"; fi
   done <"$scan"
   [[ -s $pinned ]] || wp_die 'SSH host fingerprint mismatch; refusing to connect.'
   chmod 600 "$pinned"
+  wp_backup_before_edit known_hosts "$known_hosts"
   mv -f "$pinned" "$known_hosts"
   rm -f "$scan" "$candidate"
   trap - EXIT
   host_key_options=(-o StrictHostKeyChecking=yes)
+else
+  # accept-new may append a first-seen host key, so preserve the exact prior file
+  # immediately before SSH receives permission to edit it.
+  wp_backup_before_edit known_hosts "$known_hosts"
 fi
 export WSL_PROXY_INSTALL_ID
 exec "$WSL_PROXY_SSH_BINARY" -NT -D "127.0.0.1:$local_port" -p "$WSL_PROXY_SSH_PORT" -i "$WSL_PROXY_KEY_PATH" \
@@ -392,9 +645,43 @@ local_port=1080
 # shellcheck disable=SC1091
 . "$HOME/.local/bin/wsl-proxy-common"
 wp_load_config
+wp_lock_lifecycle
 logfile=$data_dir/tunnel.log
 mode=process
 pid=
+start=
+token=
+record_tmp=
+cleanup_armed=0
+spawn_critical=0
+pending_signal=0
+cleanup_spawn() {
+  local cleanup_rc=0
+  (( cleanup_armed )) || return 0
+  if [[ ! $start =~ ^[0-9]+$ ]]; then
+    for _ in {1..20}; do start=$(wp_start_time "$pid" || true); [[ $start =~ ^[0-9]+$ ]] && break; sleep 0.05; done
+  fi
+  if [[ $start =~ ^[0-9]+$ ]]; then
+    wp_kill_spawn "$pid" "$start" "$token" || cleanup_rc=1
+    wp_process_instance_matches "$pid" "$start" && cleanup_rc=1
+    (( cleanup_rc )) || wp_remove_spawn_record "$pid" "$start" "$token"
+  else
+    cleanup_rc=1
+  fi
+  rm -f "${record_tmp:-}"
+  if (( cleanup_rc == 0 )); then cleanup_armed=0; fi
+  return "$cleanup_rc"
+}
+cleanup_spawn_on_exit() {
+  local status=$?
+  cleanup_spawn || echo 'ERROR: spawned tunnel process could not be stopped.' >&2
+  return "$status"
+}
+handle_spawn_signal() {
+  local status=$1
+  if (( spawn_critical )); then pending_signal=$status; return 0; fi
+  exit "$status"
+}
 if wp_systemd_available; then
   mode=systemd
   systemctl --user start wsl-proxy.service || {
@@ -403,18 +690,38 @@ if wp_systemd_available; then
     wp_die 'The managed systemd service failed to start.'
   }
 else
-  if wp_record_valid; then
-    pid=$WP_PID
+  spawn_critical=1
+  trap cleanup_spawn_on_exit EXIT
+  trap 'handle_spawn_signal 129' HUP
+  trap 'handle_spawn_signal 130' INT
+  trap 'handle_spawn_signal 143' TERM
+  recorded_spawn=0
+  if wp_read_record; then
+    pid=$WP_PID start=$WP_START token=$WP_TOKEN
+    if wp_process_instance_matches "$pid" "$start" && ! wp_spawn_matches "$pid" "$start" "$token"; then
+      for _ in {1..20}; do
+        wp_spawn_matches "$pid" "$start" "$token" && break
+        wp_process_instance_matches "$pid" "$start" || break
+        sleep 0.05
+      done
+    fi
+    if wp_spawn_matches "$pid" "$start" "$token"; then
+      recorded_spawn=1
+    elif wp_process_instance_matches "$pid" "$start"; then
+      wp_die 'The fallback PID record names a live process whose managed token cannot be verified.'
+    else
+      wp_remove_spawn_record "$pid" "$start" "$token"
+    fi
+  fi
+  if (( recorded_spawn )); then
+    cleanup_armed=1
   else
     rm -f "$pidfile"
     if wp_any_listener; then wp_die "Port 127.0.0.1:$local_port is occupied by an unrelated process."; fi
     token=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
-    start=''
-    record_tmp=''
-    WSL_PROXY_INSTANCE_TOKEN=$token nohup "$HOME/.local/bin/wsl-proxy-tunnel" >>"$logfile" 2>&1 &
+    WSL_PROXY_INSTANCE_TOKEN=$token nohup "$HOME/.local/bin/wsl-proxy-tunnel" 8>&- >>"$logfile" 2>&1 &
     pid=$!
-    cleanup_spawn() { wp_kill_spawn "$pid" "$start" "$token" || echo 'ERROR: spawned tunnel process could not be stopped.' >&2; rm -f "${record_tmp:-}"; }
-    trap cleanup_spawn ERR EXIT INT TERM
+    cleanup_armed=1
     for _ in {1..20}; do start=$(wp_start_time "$pid" || true); [[ $start =~ ^[0-9]+$ ]] && break; sleep 0.05; done
     [[ $start =~ ^[0-9]+$ ]] || wp_die 'The SSH tunnel process exited before it could be identified.'
     record_tmp=$(mktemp "$data_dir/.tunnel.pid.XXXXXX")
@@ -423,6 +730,8 @@ else
     mv -f "$record_tmp" "$pidfile"
     record_tmp=''
   fi
+  spawn_critical=0
+  if (( pending_signal )); then exit "$pending_signal"; fi
 fi
 for _ in {1..30}; do
   if [[ $mode == systemd ]]; then
@@ -431,8 +740,15 @@ for _ in {1..30}; do
     if [[ $pid =~ ^[1-9][0-9]*$ && $systemd_start =~ ^[0-9]+$ ]] && wp_ready_pid "$pid" "$systemd_start"; then (( quiet )) || echo "Verified managed SOCKS5 proxy on 127.0.0.1:$local_port (systemd pid $pid)."; exit 0; fi
     systemctl --user is-active --quiet wsl-proxy.service || break
   else
-    if wp_record_valid && wp_ready_pid "$WP_PID" "$WP_START" "$WP_TOKEN"; then trap - ERR EXIT INT TERM; (( quiet )) || echo "Verified managed SOCKS5 proxy on 127.0.0.1:$local_port (pid $WP_PID)."; exit 0; fi
-    wp_process_expected "$pid" "${start:-}" "${token:-}" || break
+    if wp_record_matches_spawn "$pid" "$start" "$token" && wp_ready_pid "$pid" "$start" "$token"; then
+      cleanup_armed=0
+      trap - EXIT HUP INT TERM
+      (( quiet )) || echo "Verified managed SOCKS5 proxy on 127.0.0.1:$local_port (pid $pid)."
+      exit 0
+    fi
+    if ! wp_spawn_matches "$pid" "$start" "$token"; then
+      wp_process_instance_matches "$pid" "$start" || break
+    fi
   fi
   sleep 0.5
 done
@@ -440,9 +756,9 @@ if [[ $mode == systemd ]]; then
   systemctl --user disable --now wsl-proxy.service >/dev/null 2>&1 || true
   systemctl --user reset-failed wsl-proxy.service >/dev/null 2>&1 || true
 else
-  wp_stop_recorded || wp_die 'Failed to stop the managed fallback process.'
+  if ! cleanup_spawn; then wp_die 'Failed to stop the managed fallback process.'; fi
 fi
-trap - ERR EXIT INT TERM
+trap - EXIT HUP INT TERM
 wp_die 'The managed SSH tunnel did not pass process, listener-ownership, and SOCKS5 readiness checks; it was stopped and disabled.'
 HELPER
 
@@ -453,6 +769,7 @@ IFS=$'\n\t'
 # shellcheck disable=SC1091
 . "$HOME/.local/bin/wsl-proxy-common"
 wp_load_config || exit 1
+wp_lock_lifecycle || exit 1
 if wp_systemd_available; then
   systemd_pid=$(wp_systemd_pid)
   if [[ $systemd_pid =~ ^[1-9][0-9]*$ ]]; then
@@ -526,7 +843,12 @@ Restart=no
 WantedBy=default.target
 UNIT
 
-# Capture originals once per install lifecycle, before the first overwrite.
+verify_bashrc_preflight || die '.bashrc changed after preflight validation; no managed operational files were replaced.'
+
+# Capture managed-target originals once per install lifecycle, before the first
+# overwrite. .bashrc has a separate lifecycle snapshot because it is edited only
+# on fallback systems and must not be rolled back when this lifecycle never
+# touched it.
 declare -a ids=(config enrollment known_hosts common tunnel proxy_on proxy_off proxy_status proxy_chrome proxy_copy proxy_paste service)
 declare -a targets=("$config_file" "$enrollment_file" "$known_hosts" "$bin_dir/wsl-proxy-common" "$bin_dir/wsl-proxy-tunnel" "$bin_dir/proxy-on" "$bin_dir/proxy-off" "$bin_dir/proxy-status" "$bin_dir/proxy-chrome" "$bin_dir/proxy-copy" "$bin_dir/proxy-paste" "$service")
 validate_manifest() {
@@ -563,39 +885,120 @@ else
   chmod 600 "$manifest_tmp"
   mv -f "$manifest_tmp" "$manifest"
 fi
-install_managed() {
-  local source=$1 target=$2 mode=$3
-  assert_file_target "$target" "managed target $target"
-  if [[ ! -e $target ]] || ! cmp -s "$source" "$target"; then install -m "$mode" "$source" "$target"; fi
+backup_counter=0
+backup_before_edit() {
+  local id=$1 target=$2 stamp backup_dir
+  [[ -e $target ]] || return 0
+  assert_file_target "$target" "pre-edit backup source $target"
+  stamp=$(date -u +%Y%m%dT%H%M%S.%NZ)
+  backup_counter=$((backup_counter + 1))
+  backup_dir=$preedit_root/$stamp-$$-$backup_counter
+  mkdir -p "$backup_dir"
+  chmod 700 "$preedit_root" "$backup_dir"
+  cp -a -- "$target" "$backup_dir/$id"
+  cmp -s "$target" "$backup_dir/$id" || die "Pre-edit backup verification failed for $target."
+  printf 'timestamp=%s\nid=%s\ntarget=%s\n' "$stamp" "$id" "$target" >"$backup_dir/metadata"
+  chmod 600 "$backup_dir/metadata"
 }
-install_managed "$tmpdir/config" "$config_file" 600
-install_managed "$tmpdir/wsl-proxy-common" "$bin_dir/wsl-proxy-common" 700
-for helper in wsl-proxy-tunnel proxy-on proxy-off proxy-status proxy-chrome proxy-copy proxy-paste; do install_managed "$tmpdir/$helper" "$bin_dir/$helper" 700; done
-install_managed "$tmpdir/wsl-proxy.service" "$service" 600
+capture_bashrc_original() {
+  local state staged state_tmp
+  if [[ -e $bashrc_touched ]]; then return 0; fi
+  if [[ -e $bashrc_original_state ]]; then
+    state=$(cat "$bashrc_original_state")
+    case $state in
+      present) [[ -f $bashrc_original && ! -L $bashrc_original ]] || die 'The lifecycle .bashrc original is incomplete.' ;;
+      absent) [[ ! -e $bashrc_original ]] || die 'The lifecycle .bashrc original state is inconsistent.' ;;
+      *) die 'The lifecycle .bashrc original state is invalid.' ;;
+    esac
+  else
+    if [[ -e $bashrc ]]; then
+      staged=$(mktemp "$data_dir/originals-v1/.bashrc-original.XXXXXX")
+      cp -a -- "$bashrc" "$staged"
+      cmp -s "$bashrc" "$staged" || { rm -f -- "$staged"; die 'Could not verify the lifecycle .bashrc original.'; }
+      mv -f -- "$staged" "$bashrc_original"
+      state=present
+    else
+      state=absent
+    fi
+    state_tmp=$(mktemp "$data_dir/originals-v1/.bashrc-state.XXXXXX")
+    printf '%s\n' "$state" >"$state_tmp"
+    chmod 600 "$state_tmp"
+    mv -f -- "$state_tmp" "$bashrc_original_state"
+  fi
+  touch "$bashrc_touched"
+  chmod 600 "$bashrc_touched"
+}
+atomic_install() {
+  local source=$1 target=$2 mode=$3 target_dir staged
+  target_dir=$(dirname -- "$target")
+  staged=$(mktemp "$target_dir/.wsl-proxy-install.XXXXXX")
+  if ! install -m "$mode" "$source" "$staged" || ! cmp -s "$source" "$staged"; then
+    rm -f -- "$staged"
+    die "Could not stage and validate managed target $target."
+  fi
+  if ! mv -f -- "$staged" "$target"; then
+    rm -f -- "$staged"
+    die "Could not atomically replace managed target $target."
+  fi
+}
+install_managed() {
+  local source=$1 target=$2 mode=$3 id=$4
+  assert_file_target "$target" "managed target $target"
+  if [[ ! -e $target ]] || ! cmp -s "$source" "$target"; then
+    backup_before_edit "$id" "$target"
+    atomic_install "$source" "$target" "$mode"
+  fi
+}
+install_managed "$tmpdir/config" "$config_file" 600 config
+install_managed "$tmpdir/wsl-proxy-common" "$bin_dir/wsl-proxy-common" 700 common
+install_managed "$tmpdir/wsl-proxy-tunnel" "$bin_dir/wsl-proxy-tunnel" 700 tunnel
+for helper in proxy-on proxy-off proxy-status proxy-chrome proxy-copy proxy-paste; do install_managed "$tmpdir/$helper" "$bin_dir/$helper" 700 "${helper//-/_}"; done
+install_managed "$tmpdir/wsl-proxy.service" "$service" 600 service
 printf '%s\n' "$install_id" >"$tmpdir/enrolled"
-install_managed "$tmpdir/enrolled" "$enrollment_file" 600
+install_managed "$tmpdir/enrolled" "$enrollment_file" 600 enrollment
 
 use_systemd=0
 if (( ! DRY_RUN )) && command -v systemctl >/dev/null && [[ $(cat /proc/1/comm 2>/dev/null || true) == systemd ]] && systemctl --user show-environment >/dev/null 2>&1; then use_systemd=1; fi
 add_shell_hook() {
-  touch "$bashrc"
-  awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '$0 == begin { managed=1; next } $0 == end { managed=0; next } !managed { print }' "$bashrc" >"$tmpdir/bashrc.clean"
-  { cat "$tmpdir/bashrc.clean"; printf '\n%s\n' "$MANAGED_BEGIN"; cat <<'BLOCK'
-# Start only the enrolled, verified Linux-side SSH tunnel in interactive shells.
-# Chrome and Windows programs are never auto-started.
-if [[ $- == *i* ]] && [[ -x $HOME/.local/bin/proxy-on ]]; then
-  "$HOME/.local/bin/proxy-on" --quiet || true
-fi
-BLOCK
-    printf '%s\n' "$MANAGED_END"; } >"$tmpdir/bashrc.new"
-  if ! cmp -s "$bashrc" "$tmpdir/bashrc.new"; then cat "$tmpdir/bashrc.new" >"$bashrc"; fi
+  local staged
+  if (( bashrc_preflight_has_current_block )); then return 0; fi
+  if [[ ! -e $bashrc ]] || ! cmp -s "$bashrc" "$bashrc_preflight/candidate"; then
+    capture_bashrc_original
+    backup_before_edit bashrc "$bashrc"
+    staged=$(mktemp "$(dirname -- "$bashrc")/.bashrc.wsl-proxy.XXXXXX")
+    if [[ -e $bashrc ]]; then
+      cp -a -- "$bashrc" "$staged" || { rm -f -- "$staged"; die 'Could not preserve .bashrc metadata on the staged replacement.'; }
+    else
+      chmod 644 "$staged"
+    fi
+    if ! cat "$bashrc_preflight/candidate" >"$staged" || ! cmp -s "$bashrc_preflight/candidate" "$staged" || ! validate_bash_syntax "$staged"; then
+      rm -f -- "$staged"
+      die 'Could not stage and validate the .bashrc update.'
+    fi
+    if ! mv -f -- "$staged" "$bashrc"; then
+      rm -f -- "$staged"
+      die 'Could not atomically replace .bashrc; the original remains unchanged.'
+    fi
+  fi
 }
 remove_shell_hook() {
+  local staged
   [[ -f $bashrc ]] || return 0
-  awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '$0 == begin { managed=1; next } $0 == end { managed=0; next } !managed { print }' "$bashrc" >"$tmpdir/bashrc.clean"
-  if ! cmp -s "$bashrc" "$tmpdir/bashrc.clean"; then cat "$tmpdir/bashrc.clean" >"$bashrc"; fi
+  if ! cmp -s "$bashrc" "$bashrc_preflight/clean"; then
+    # A lifecycle created by this release already has an exact original. An
+    # older lifecycle does not; do not mislabel its managed file as original.
+    [[ -e $bashrc_touched ]] && capture_bashrc_original
+    backup_before_edit bashrc "$bashrc"
+    staged=$(mktemp "$(dirname -- "$bashrc")/.bashrc.wsl-proxy.XXXXXX")
+    cp -a -- "$bashrc" "$staged" || { rm -f -- "$staged"; die 'Could not preserve .bashrc metadata on the staged cleanup.'; }
+    cat "$bashrc_preflight/clean" >"$staged"
+    cmp -s "$bashrc_preflight/clean" "$staged" || { rm -f -- "$staged"; die 'Could not validate staged .bashrc cleanup.'; }
+    mv -f -- "$staged" "$bashrc" || { rm -f -- "$staged"; die 'Could not atomically clean .bashrc.'; }
+  fi
 }
 if (( DRY_RUN )); then
+  if (( INTERNAL_TEST_SHELL_HOOK )); then add_shell_hook; fi
+  if (( INTERNAL_TEST_SHELL_CLEANUP )); then remove_shell_hook; fi
   info 'Dry run complete: files were written under HOME, but no service, tunnel, or auto-start hook was started.'
 elif (( use_systemd )); then
   "$bin_dir/proxy-off" >/dev/null || die 'Could not safely stop a previous managed fallback tunnel.'
