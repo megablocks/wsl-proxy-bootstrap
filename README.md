@@ -2,14 +2,14 @@
 
 Secure, rerunnable setup for an isolated Google Chrome profile routed through an SSH SOCKS5 tunnel on Ubuntu/Debian under WSL2.
 
-> **Release status:** the raw `main` installer below is live. Development continues through reviewed pull requests into `dev`, followed by a separate release promotion to `main`.
+> **Release status:** the final hardening changes are in open PR [#3](https://github.com/megablocks/wsl-proxy-bootstrap/pull/3), intentionally unmerged. The commands below pin the independently reviewed installer commit so they do not fetch the older `main` copy or change unexpectedly.
 
 ## One-command install
 
 Run as your normal WSL user — **never with `sudo`**:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/megablocks/wsl-proxy-bootstrap/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/megablocks/wsl-proxy-bootstrap/a8d6274e6a7c7c766540bbf52bc7b239fe987ee8/install.sh | bash
 ```
 
 The installer itself uses `sudo` only for APT/keyring/repository operations. On first run it creates a new, dedicated Ed25519 key inside the WSL filesystem, prints **only the public key**, and exits with status 20. Before enrollment it installs no launchers, configuration, service, or shell hook, and it does not start or claim a tunnel.
@@ -18,13 +18,13 @@ The installer itself uses `sudo` only for APT/keyring/repository operations. On 
 2. Rerun only after enrollment:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/megablocks/wsl-proxy-bootstrap/main/install.sh | WSL_PROXY_ENROLLED=1 bash
+curl -fsSL https://raw.githubusercontent.com/megablocks/wsl-proxy-bootstrap/a8d6274e6a7c7c766540bbf52bc7b239fe987ee8/install.sh | WSL_PROXY_ENROLLED=1 bash
 ```
 
 A supplied key must already exist in the WSL filesystem and still requires explicit enrollment confirmation:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/megablocks/wsl-proxy-bootstrap/main/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/megablocks/wsl-proxy-bootstrap/a8d6274e6a7c7c766540bbf52bc7b239fe987ee8/install.sh | \
   WSL_PROXY_SSH_HOST=example.net \
   WSL_PROXY_SSH_USER=proxy-user \
   WSL_PROXY_KEY_PATH="$HOME/.ssh/proxy_ed25519" \
